@@ -1,0 +1,23 @@
+# Kamailio to Zabbix Synchronization Script
+# Dependências do projeto
+
+# Banco de dados
+psycopg2-binary==2.9.9
+
+# API HTTP e JSON-RPC para Zabbix
+requests==2.31.0
+
+# Alternativa: pyzabbix (mais especializada para Zabbix)
+pyzabbix==1.7.0
+
+# Utilitários
+python-dotenv==1.0.0  # Para variáveis de ambiente
+
+# Testing
+pytest==7.4.3
+pytest-cov==4.1.0
+
+# Code quality
+pylint==3.0.2
+black==23.11.0
+flake8==6.1.0
