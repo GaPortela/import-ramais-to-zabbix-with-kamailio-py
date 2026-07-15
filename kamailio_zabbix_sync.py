@@ -4,16 +4,17 @@ Kamailio to Zabbix Synchronization Script
 Sincroniza ramais ativos do Kamailio com hosts no Zabbix
 """
 
-import re
+import argparse
 import logging
-import json
 import os
-from datetime import datetime
-from typing import Optional, Dict, List, Tuple
+import re
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
 import psycopg2
-from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
+from psycopg2.extras import RealDictCursor
 
 # ============================================================================
 # CONFIGURAÇÃO
@@ -22,31 +23,51 @@ from dotenv import load_dotenv
 # Carrega variáveis de ambiente do arquivo .env
 load_dotenv()
 
-# Conexão PostgreSQL (Kamailio)
-DB_CONFIG = {
-    'host': os.getenv('KAMAILIO_DB_HOST', ),
-    'port': int(os.getenv('KAMAILIO_DB_PORT', )),
-    'database': os.getenv('KAMAILIO_DB_NAME', ),
-    'user': os.getenv('KAMAILIO_DB_USER', ''),
-    'password': os.getenv('KAMAILIO_DB_PASSWORD', )
-}
 
-# Configuração Zabbix (suporta Token de API ou Usuário/Senha)
-ZABBIX_CONFIG = {
-    'url': os.getenv('ZABBIX_URL', ),
-    'api_token': os.getenv('ZABBIX_API_TOKEN'),  # Preferência 1: Token de API
-    'user': os.getenv('ZABBIX_USER'),  # Preferência 2: Usuário (fallback)
-    'password': os.getenv('ZABBIX_PASSWORD'),  # Preferência 2: Senha (fallback)
-    'group_name': os.getenv('ZABBIX_GROUP_NAME', ),
-    'template_name': os.getenv('ZABBIX_TEMPLATE_NAME', )
-}
+def build_db_config() -> Dict[str, object]:
+    """Retorna um dicionário de configuração com defaults seguros."""
+    return {
+        'host': os.getenv('KAMAILIO_DB_HOST', 'localhost'),
+        'port': int(os.getenv('KAMAILIO_DB_PORT', '5432')),
+        'database': os.getenv('KAMAILIO_DB_NAME', 'kamailio'),
+        'user': os.getenv('KAMAILIO_DB_USER', 'kamailio'),
+        'password': os.getenv('KAMAILIO_DB_PASSWORD', '')
+    }
+
+
+def build_zabbix_config() -> Dict[str, Optional[str]]:
+    """Retorna configuração do Zabbix com defaults seguros."""
+    return {
+        'url': os.getenv('ZABBIX_URL', 'http://zabbix-web/zabbix/api_jsonrpc.php'),
+        'api_token': os.getenv('ZABBIX_API_TOKEN') or None,  # Preferência 1: Token de API
+        'user': os.getenv('ZABBIX_USER') or None,  # Preferência 2: Usuário (fallback)
+        'password': os.getenv('ZABBIX_PASSWORD') or None,  # Preferência 2: Senha (fallback)
+        'group_name': os.getenv('ZABBIX_GROUP_NAME', 'Ramais'),
+        'template_name': os.getenv('ZABBIX_TEMPLATE_NAME', 'ICMP Ping')
+    }
+
+
+def parse_bool(value: Optional[str]) -> bool:
+    """Converte valores de ambiente para booleanos."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+
+DB_CONFIG = build_db_config()
+ZABBIX_CONFIG = build_zabbix_config()
+
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
+LOG_FILE = os.getenv('LOG_FILE', 'kamailio_zabbix_sync.log')
 
 # Configuração de Logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('kamailio_zabbix_sync.log'),
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -258,8 +279,8 @@ class DataParser:
             for pattern in patterns[marca]:
                 match = re.search(pattern, user_agent_upper)
                 if match:
-                    modelo = match.group(1) if match.lastindex else match.group(0)
-                    return modelo.upper()
+                    modelo = match.group(0).upper()
+                    return modelo
         
         # Se não conseguir extrair, tenta pegar primeira sequência significativa
         match = re.search(r'(\b[A-Z]{2,}\d+[A-Z0-9]*\b)', user_agent_upper)
@@ -723,11 +744,18 @@ class ZabbixAPI:
 # FUNÇÃO PRINCIPAL
 # ============================================================================
 
-def main():
+def main(dry_run: Optional[bool] = None):
     """Função principal de orquestração."""
-    
+
+    if dry_run is None:
+        dry_run = parse_bool(os.getenv('DRY_RUN', 'False'))
+
     logger.info("Iniciando sincronização Kamailio → Zabbix")
     logger.info(f"Timestamp: {datetime.now().isoformat()}\n")
+
+    if dry_run:
+        logger.info("Modo dry-run ativo: nenhuma conexão com o banco ou Zabbix será realizada.")
+        return True
     
     # Conecta ao banco do Kamailio
     db = KamailioDB(DB_CONFIG)
@@ -770,5 +798,9 @@ def main():
 
 
 if __name__ == '__main__':
-    sucesso = main()
+    parser = argparse.ArgumentParser(description='Sincroniza ramais Kamailio para Zabbix')
+    parser.add_argument('--dry-run', action='store_true', help='Executa apenas o fluxo de validação sem acessar o banco/Zabbix')
+    args = parser.parse_args()
+
+    sucesso = main(dry_run=args.dry_run)
     exit(0 if sucesso else 1)
