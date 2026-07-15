@@ -1,11 +1,20 @@
-.PHONY: help install test lint format run clean setup
+.PHONY: help install test lint format run clean setup docker-build docker-run docker-test docker-shell
 
 # Configuração
-PYTHON := python3
-PIP := pip3
+PYTHON ?= python3
+PIP ?= pip3
 VENV := venv
 SCRIPT := kamailio_zabbix_sync.py
-TESTS := test_data_parser.py
+TESTS := test_data_parser.py test_runtime_config.py
+DOCKER_IMAGE ?= kamailio-zabbix-sync
+
+ifeq ($(OS),Windows_NT)
+VENV_PYTHON := $(VENV)/Scripts/python.exe
+VENV_PIP := $(VENV)/Scripts/pip.exe
+else
+VENV_PYTHON := $(VENV)/bin/python
+VENV_PIP := $(VENV)/bin/pip
+endif
 
 help:
 	@echo "╔══════════════════════════════════════════════════════════════╗"
@@ -19,6 +28,10 @@ help:
 	@echo "Development:"
 	@echo "  make run                - Executar script principal"
 	@echo "  make test               - Rodar testes unitários"
+	@echo "  make docker-build       - Construir imagem Docker"
+	@echo "  make docker-run         - Rodar container Docker"
+	@echo "  make docker-test        - Rodar testes no container"
+	@echo ""
 	@echo "  make test-verbose       - Testes com saída detalhada"
 	@echo "  make coverage           - Testes com cobertura"
 	@echo "  make lint               - Verificar código (pylint, flake8)"
@@ -47,9 +60,8 @@ setup:
 		echo "  ├─ Criando virtual env..."; \
 		$(PYTHON) -m venv $(VENV); \
 	fi
-	@echo "  ├─ Ativando venv..."
 	@echo "  ├─ Instalando dependências..."
-	@. $(VENV)/bin/activate && $(PIP) install -r requirements.txt
+	@$(VENV_PIP) install -r requirements.txt
 	@echo "  └─ ✓ Setup completo!"
 	@echo ""
 	@echo "📝 Próximo passo:"
@@ -60,7 +72,7 @@ setup:
 
 install:
 	@echo "📦 Instalando dependências..."
-	@. $(VENV)/bin/activate && $(PIP) install -r requirements.txt
+	@$(VENV_PIP) install -r requirements.txt
 	@echo "✓ Dependências instaladas"
 
 # ============================================================================
@@ -69,19 +81,19 @@ install:
 
 run:
 	@echo "▶️  Executando script principal..."
-	@. $(VENV)/bin/activate && $(PYTHON) $(SCRIPT)
+	@$(VENV_PYTHON) $(SCRIPT)
 
 test:
 	@echo "🧪 Rodando testes unitários..."
-	@. $(VENV)/bin/activate && $(PYTHON) -m pytest $(TESTS) -q
+	@$(VENV_PYTHON) -m pytest $(TESTS) -q
 
 test-verbose:
 	@echo "🧪 Rodando testes (verbose)..."
-	@. $(VENV)/bin/activate && $(PYTHON) -m pytest $(TESTS) -v
+	@$(VENV_PYTHON) -m pytest $(TESTS) -v
 
 coverage:
 	@echo "📊 Executando testes com cobertura..."
-	@. $(VENV)/bin/activate && $(PYTHON) -m pytest $(TESTS) \
+	@$(VENV_PYTHON) -m pytest $(TESTS) \
 		--cov=kamailio_zabbix_sync \
 		--cov-report=term-missing \
 		--cov-report=html
@@ -90,17 +102,17 @@ coverage:
 
 lint:
 	@echo "🔍 Verificando código (pylint, flake8)..."
-	@. $(VENV)/bin/activate && pylint $(SCRIPT) $(TESTS) || true
-	@. $(VENV)/bin/activate && flake8 $(SCRIPT) $(TESTS) || true
+	@$(VENV_PYTHON) -m pylint $(SCRIPT) $(TESTS) || true
+	@$(VENV_PYTHON) -m flake8 $(SCRIPT) $(TESTS) || true
 
 format:
 	@echo "🎨 Formatando código com Black..."
-	@. $(VENV)/bin/activate && black $(SCRIPT) $(TESTS)
+	@$(VENV_PYTHON) -m black $(SCRIPT) $(TESTS)
 	@echo "✓ Código formatado"
 
 format-check:
 	@echo "🎨 Verificando formatação..."
-	@. $(VENV)/bin/activate && black --check $(SCRIPT) $(TESTS)
+	@$(VENV_PYTHON) -m black --check $(SCRIPT) $(TESTS)
 
 check: lint format-check
 	@echo "✓ Verificações passaram"
@@ -153,13 +165,33 @@ version:
 	@echo "📊 Informações do Ambiente"
 	@echo ""
 	@echo "Python:"
-	@$(PYTHON) --version
+	@$(VENV_PYTHON) --version
 	@echo ""
 	@echo "Dependências instaladas:"
-	@. $(VENV)/bin/activate && $(PIP) list | grep -E "psycopg2|requests|pyzabbix|pytest"
+	@$(VENV_PIP) list | grep -E "psycopg2|requests|pyzabbix|pytest"
 	@echo ""
 	@echo "Arquivos do projeto:"
 	@wc -l $(SCRIPT) $(TESTS) 2>/dev/null | tail -1
+
+# ============================================================================
+# DOCKER
+# ============================================================================
+
+docker-build:
+	@echo "🐳 Construindo imagem Docker..."
+	docker build -t $(DOCKER_IMAGE) .
+
+docker-run:
+	@echo "🐳 Executando container Docker..."
+	docker run --rm -e DRY_RUN=true $(DOCKER_IMAGE)
+
+docker-test:
+	@echo "🐳 Executando testes no container..."
+	docker run --rm $(DOCKER_IMAGE) python -m pytest test_data_parser.py test_runtime_config.py -q
+
+docker-shell:
+	@echo "🐳 Abrindo shell no container..."
+	docker run --rm -it $(DOCKER_IMAGE) /bin/bash
 
 # ============================================================================
 # SHORTCUTS

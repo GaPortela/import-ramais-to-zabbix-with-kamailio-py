@@ -19,7 +19,7 @@ Automatiza a sincronização de ramais do **Kamailio** (servidor SIP) com **Zabb
 
 ```bash
 # Clone o repositório
-cd seu-projeto
+cd import-ramais-to-zabbix-with-kamailio-py
 
 # Crie um ambiente virtual
 python3 -m venv venv
@@ -299,6 +299,6 @@ Consulte:
 
 ---
 
-**Versão:** 1.0.0  
+**Versão:** 0.0.1  
 **Status:** Em Desenvolvimento (Etapa 1 ✅)  
-**Última Atualização:** Janeiro de 2024
+**Última Atualização:** 14/07/2026

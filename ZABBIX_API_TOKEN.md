@@ -96,7 +96,7 @@ Permissions:
 
 ## Segurança
 
-### ✅ Boas Práticas
+### Boas Práticas
 
 - Use **Token de API** em vez de usuário/senha
 - Tokens com **data de expiração** curta (30-90 dias)
@@ -104,7 +104,7 @@ Permissions:
 - Use **roles com permissões mínimas** necessárias
 - Regenere tokens periodicamente
 
-### ❌ Evite
+### Evite
 
 - Colocar credenciais em arquivos versionados
 - Usar tokens com expiração nunca ou muito longa
