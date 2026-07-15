@@ -12,11 +12,35 @@ class TestRuntimeConfig(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             config = build_db_config()
 
-            self.assertEqual(config["host"], "localhost")
-            self.assertEqual(config["port"], 5432)
-            self.assertEqual(config["database"], "kamailio")
-            self.assertEqual(config["user"], "kamailio")
-            self.assertEqual(config["password"], "")
+            self.assertEqual(config, {
+                'dsn': 'postgresql://kamailio@localhost:5432/kamailio'
+            })
+
+    def test_db_config_builds_dsn_from_env_fields(self):
+        with patch.dict(os.environ, {
+            'KAMAILIO_DB_HOST': 'db.example.com',
+            'KAMAILIO_DB_PORT': '5432',
+            'KAMAILIO_DB_NAME': 'kamailio',
+            'KAMAILIO_DB_USER': 'kamailio',
+            'KAMAILIO_DB_PASSWORD': 'secret',
+        }, clear=True):
+            config = build_db_config()
+
+            self.assertEqual(config, {
+                'dsn': 'postgresql://kamailio:secret@db.example.com:5432/kamailio'
+            })
+
+    def test_db_config_uses_dsn_when_db_url_set(self):
+        with patch.dict(os.environ, {
+            'KAMAILIO_DB_URL': 'postgresql://kamailio:secret@db.example.com:5432/kamailio',
+            'KAMAILIO_DB_HOST': 'ignored',
+            'KAMAILIO_DB_USER': 'ignored',
+        }, clear=True):
+            config = build_db_config()
+
+            self.assertEqual(config, {
+                'dsn': 'postgresql://kamailio:secret@db.example.com:5432/kamailio'
+            })
 
     def test_zabbix_config_uses_sane_defaults_when_env_missing(self):
         with patch.dict(os.environ, {}, clear=True):

@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote_plus
 
 import psycopg2
 from dotenv import load_dotenv
@@ -25,14 +26,28 @@ load_dotenv()
 
 
 def build_db_config() -> Dict[str, object]:
-    """Retorna um dicionário de configuração com defaults seguros."""
-    return {
-        'host': os.getenv('KAMAILIO_DB_HOST', 'localhost'),
-        'port': int(os.getenv('KAMAILIO_DB_PORT', '5432')),
-        'database': os.getenv('KAMAILIO_DB_NAME', 'kamailio'),
-        'user': os.getenv('KAMAILIO_DB_USER', 'kamailio'),
-        'password': os.getenv('KAMAILIO_DB_PASSWORD', '')
-    }
+    """Retorna configuração de conexão PostgreSQL.
+
+    Se `KAMAILIO_DB_URL` ou `DATABASE_URL` estiver definido, usa essa URL.
+    Caso contrário, constrói automaticamente a URL a partir dos campos individuais.
+    """
+    db_url = os.getenv('KAMAILIO_DB_URL') or os.getenv('DATABASE_URL')
+    if db_url:
+        return {'dsn': db_url}
+
+    host = os.getenv('KAMAILIO_DB_HOST', 'localhost')
+    port = int(os.getenv('KAMAILIO_DB_PORT', '5432'))
+    database = os.getenv('KAMAILIO_DB_NAME', 'kamailio')
+    user = quote_plus(os.getenv('KAMAILIO_DB_USER', 'kamailio'))
+    password = os.getenv('KAMAILIO_DB_PASSWORD', '')
+
+    if password:
+        password = quote_plus(password)
+        dsn = f"postgresql://{user}:{password}@{host}:{port}/{database}"
+    else:
+        dsn = f"postgresql://{user}@{host}:{port}/{database}"
+
+    return {'dsn': dsn}
 
 
 def build_zabbix_config() -> Dict[str, Optional[str]]:
@@ -316,7 +331,10 @@ class KamailioDB:
         """
         try:
             self.connection = psycopg2.connect(**self.db_config)
-            logger.info(f"Conectado ao PostgreSQL em {self.db_config['host']}:{self.db_config['port']}")
+            if 'dsn' in self.db_config:
+                logger.info("Conectado ao PostgreSQL via URL configurada")
+            else:
+                logger.info(f"Conectado ao PostgreSQL em {self.db_config['host']}:{self.db_config['port']}")
             return True
         except psycopg2.Error as e:
             logger.error(f"Erro ao conectar ao PostgreSQL: {e}")
