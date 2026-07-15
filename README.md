@@ -39,12 +39,23 @@ cp .env.example .env
 nano .env
 ```
 
-**Campos obrigatórios:**
+**Campos de conexão PostgreSQL:**
 ```env
+# Opção preferida: URL de conexão completa incluindo usuário e senha
+# Exemplo: postgresql://kamailio:sua_senha@seu-kamailio-host:5432/kamailio
+KAMAILIO_DB_URL=postgresql://kamailio:sua_senha@localhost:5432/kamailio
+
+# Alternativa legada / fallback: host/port/database/user/password separados
+# Se `KAMAILIO_DB_URL` não estiver definido, a URL será gerada automaticamente.
 KAMAILIO_DB_HOST=seu-kamailio-host
+KAMAILIO_DB_PORT=5432
+KAMAILIO_DB_NAME=kamailio
 KAMAILIO_DB_USER=kamailio
 KAMAILIO_DB_PASSWORD=sua_senha
+```
 
+**Campos Zabbix:**
+```env
 ZABBIX_URL=http://seu-zabbix.com/api_jsonrpc.php
 
 # Opção 1: Token de API (recomendado - mais seguro)
@@ -63,6 +74,22 @@ python3 kamailio_zabbix_sync.py
 
 # Rodar testes
 pytest test_data_parser.py -v
+```
+
+### 5️⃣ Usando Docker
+
+```bash
+# Build da imagem
+docker build -t kamailio-zabbix-sync .
+
+# Executar com arquivo de ambiente
+docker run --rm --env-file .env kamailio-zabbix-sync
+```
+
+Se quiser executar em modo dry-run, você pode sobrescrever o comando:
+
+```bash
+docker run --rm --env-file .env kamailio-zabbix-sync python kamailio_zabbix_sync.py --dry-run
 ```
 
 ---

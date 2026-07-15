@@ -158,8 +158,20 @@ nano .env  # ou seu editor preferido
 ```
 
 **Campos obrigatórios:**
-- `KAMAILIO_DB_HOST`, `KAMAILIO_DB_USER`, `KAMAILIO_DB_PASSWORD`
+- `KAMAILIO_DB_URL` ou (`KAMAILIO_DB_HOST`, `KAMAILIO_DB_USER`, `KAMAILIO_DB_PASSWORD`)
 - `ZABBIX_URL`, `ZABBIX_USER`, `ZABBIX_PASSWORD`
+
+`KAMAILIO_DB_URL` tem prioridade quando definido. Caso não seja informado, a URL será criada automaticamente a partir das variáveis:
+- `KAMAILIO_DB_HOST`
+- `KAMAILIO_DB_PORT`
+- `KAMAILIO_DB_NAME`
+- `KAMAILIO_DB_USER`
+- `KAMAILIO_DB_PASSWORD`
+
+Exemplo de URL gerada automaticamente:
+```env
+postgresql://kamailio:senha@localhost:5432/kamailio
+```
 
 ### 4. Teste de Conectividade
 
@@ -168,6 +180,19 @@ nano .env  # ou seu editor preferido
 python3 -c "import psycopg2; psycopg2.connect(host='localhost', database='kamailio', user='kamailio', password='senha')"
 
 # Se sucesso, não retorna erro
+```
+
+### 5. Uso com Docker
+
+```bash
+docker build -t kamailio-zabbix-sync .
+docker run --rm --env-file .env kamailio-zabbix-sync
+```
+
+Para rodar em modo dry-run:
+
+```bash
+docker run --rm --env-file .env kamailio-zabbix-sync python kamailio_zabbix_sync.py --dry-run
 ```
 
 ---
