@@ -61,6 +61,7 @@ htmlcov/
 .hypothesis/
 *.cover
 .coverage.*
+inspecao_ramal.json
 
 # ============================================================================
 # AMBIENTES E CONFIGURAÇÕES SENSÍVEIS

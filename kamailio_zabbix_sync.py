@@ -762,7 +762,97 @@ class ZabbixAPI:
 # FUNÇÃO PRINCIPAL
 # ============================================================================
 
-def main(dry_run: Optional[bool] = None):
+def gerar_relatorio_inspecao(ramais_brutos: List[Dict], ramais_processados: List[RamalInfo], ramais_rejeitados: List[Dict]) -> str:
+    """Gera um relatório legível para inspeção dos dados crus e parseados."""
+    linhas = []
+    linhas.append('=' * 80)
+    linhas.append('RELATÓRIO DE INSPEÇÃO DE DADOS')
+    linhas.append('=' * 80)
+    linhas.append('')
+    linhas.append('Dados brutos retornados pelo banco:')
+    if ramais_brutos:
+        for item in ramais_brutos:
+            linhas.append(f"- username={item.get('username')} | contact={item.get('contact')} | received={item.get('received')} | user_agent={item.get('user_agent')} | expires={item.get('expires')}")
+    else:
+        linhas.append('- Nenhum dado bruto encontrado')
+
+    linhas.append('')
+    linhas.append('Dados parseados:')
+    if ramais_processados:
+        for ramal in ramais_processados:
+            linhas.append(
+                f"- Ramal {ramal.numero_ramal} | IP={ramal.ip} | Marca={ramal.marca} | Modelo={ramal.modelo} | "
+                f"UserAgent={ramal.user_agent} | Expires={ramal.expires} | Contact={ramal.contact}"
+            )
+    else:
+        linhas.append('- Nenhum dado parseado')
+
+    linhas.append('')
+    linhas.append('Ramais rejeitados:')
+    if ramais_rejeitados:
+        for rejeitado in ramais_rejeitados:
+            linhas.append(f"- numero={rejeitado.get('numero')} | motivo={rejeitado.get('motivo')} | detalhes={rejeitado}")
+    else:
+        linhas.append('- Nenhum ramal rejeitado')
+
+    linhas.append('')
+    linhas.append('=' * 80)
+    return '\n'.join(linhas)
+
+
+def _normalizar_para_json(valor: Any) -> Any:
+    """Converte valores não serializáveis em tipos JSON-safe."""
+    if isinstance(valor, (datetime, date)):
+        return valor.isoformat()
+    if isinstance(valor, dict):
+        return {str(key): _normalizar_para_json(value) for key, value in valor.items()}
+    if isinstance(valor, (list, tuple)):
+        return [_normalizar_para_json(item) for item in valor]
+    return valor
+
+
+def salvar_inspecao_json(ramais_brutos: List[Dict], ramais_processados: List[RamalInfo], ramais_rejeitados: List[Dict], output_path: Optional[str] = None) -> str:
+    """Salva a inspeção em um arquivo JSON para análise externa."""
+    if not output_path:
+        output_path = os.path.join(os.getcwd(), 'inspecao_ramal.json')
+
+    payload = {
+        'dados_brutos': [
+            {
+                'username': item.get('username'),
+                'username_normalizado': DataParser.normalizar_numero_ramal(item.get('username')),
+                'contact': item.get('contact'),
+                'received': item.get('received'),
+                'user_agent': item.get('user_agent'),
+                'expires': _normalizar_para_json(item.get('expires'))
+            }
+            for item in ramais_brutos
+        ],
+        'dados_parseados': [
+            {
+                'username': ramal.numero_ramal,
+                'numero_ramal': ramal.numero_ramal,
+                'ip': ramal.ip,
+                'marca': ramal.marca,
+                'modelo': ramal.modelo,
+                'user_agent': ramal.user_agent,
+                'expires': _normalizar_para_json(ramal.expires),
+                'contact': ramal.contact
+            }
+            for ramal in ramais_processados
+        ],
+        'ramais_rejeitados': _normalizar_para_json(ramais_rejeitados),
+        'gerado_em': datetime.now().isoformat()
+    }
+
+    with open(output_path, 'w', encoding='utf-8') as handle:
+        json.dump(_normalizar_para_json(payload), handle, indent=2, ensure_ascii=False)
+
+    logger.info(f"Inspeção salva em {output_path}")
+    return output_path
+
+
+def main(dry_run: Optional[bool] = None, apenas_inspecao: bool = False):
     """Função principal de orquestração."""
 
     if dry_run is None:
@@ -774,6 +864,24 @@ def main(dry_run: Optional[bool] = None):
     if dry_run:
         logger.info("Modo dry-run ativo: nenhuma conexão com o banco ou Zabbix será realizada.")
         return True
+
+    if apenas_inspecao:
+        logger.info("Modo inspeção ativo: apenas consultando os dados do banco e imprimindo relatório.")
+        db = KamailioDB(DB_CONFIG)
+        if not db.conectar():
+            logger.error("Falha na conexão com o banco de dados. Abortando.")
+            return False
+        try:
+            ramais_brutos = db.buscar_ramais_ativos()
+            ramais_processados = db.processar_ramais(ramais_brutos)
+            relatorio = gerar_relatorio_inspecao(ramais_brutos, ramais_processados, [])
+            output_path = salvar_inspecao_json(ramais_brutos, ramais_processados, [], output_path=os.path.join(os.getcwd(), 'inspecao_ramal.json'))
+            print(relatorio)
+            print(f'\nArquivo JSON salvo em: {output_path}')
+            return True
+        finally:
+            db.desconectar()
+            logger.info("Inspeção finalizada")
     
     # Conecta ao banco do Kamailio
     db = KamailioDB(DB_CONFIG)
@@ -818,7 +926,8 @@ def main(dry_run: Optional[bool] = None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Sincroniza ramais Kamailio para Zabbix')
     parser.add_argument('--dry-run', action='store_true', help='Executa apenas o fluxo de validação sem acessar o banco/Zabbix')
+    parser.add_argument('--inspecao', action='store_true', help='Consulta o banco e imprime relatório de dados brutos e parseados sem acessar o Zabbix')
     args = parser.parse_args()
 
-    sucesso = main(dry_run=args.dry_run)
+    sucesso = main(dry_run=args.dry_run, apenas_inspecao=args.inspecao)
     exit(0 if sucesso else 1)
