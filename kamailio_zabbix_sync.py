@@ -5,12 +5,13 @@ Sincroniza ramais ativos do Kamailio com hosts no Zabbix
 """
 
 import argparse
+import json
 import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
 import psycopg2
@@ -146,6 +147,59 @@ class DataParser:
         'mxipcall', 'groundwire', 'sipclient', 'bria',
         'twinkle', 'softphone', 'mobile', 'app', 'client'
     ]
+
+    @staticmethod
+    def normalizar_numero_ramal(valor: Optional[str]) -> str:
+        """Normaliza o número do ramal removendo prefixos como c312 e mantendo somente o número do ramal."""
+        if not valor:
+            return ''
+
+        texto = str(valor).strip()
+        texto = re.sub(r'(?i)\bramal\b', '', texto).strip()
+        texto = re.sub(r'(?i)^c\s*\d+\s*[-:\[\]\s/]*', '', texto).strip()
+        numeros = re.findall(r'\d+', texto)
+
+        if not numeros:
+            return ''
+
+        numero = numeros[-1]
+        if numero.startswith('0') and len(numero) > 1:
+            return numero.lstrip('0') or '0'
+        return numero
+
+    @staticmethod
+    def normalizar_modelo(user_agent: Optional[str], modelo_extraido: Optional[str] = None) -> str:
+        """Remove versionamento de firmware/softwares do modelo, preservando o nome padrão do aparelho."""
+        if not user_agent and not modelo_extraido:
+            return 'GENERICO'
+
+        base = (modelo_extraido or '').strip()
+        if not base and user_agent:
+            _, base = DataParser.extrair_marca_modelo(user_agent)
+
+        if not base:
+            return 'GENERICO'
+
+        texto = base.upper()
+        texto = re.sub(r'\s+V\d+(?:\.\d+)*', '', texto)
+        texto = re.sub(r'\s+\d+(?:\.\d+){1,}', '', texto)
+        texto = re.sub(r'\s*\([^)]*\)', '', texto)
+        texto = re.sub(r'\s+', ' ', texto).strip()
+        texto = re.sub(r'[^A-Z0-9\-\s]', '', texto)
+        texto = re.sub(r'\s+', ' ', texto).strip()
+
+        if not texto:
+            return 'GENERICO'
+
+        if 'SIP-T' in texto:
+            return texto.replace('SIP-T', 'T').replace(' ', '')
+        if 'SIP-' in texto:
+            return texto.replace('SIP-', '').replace(' ', '')
+        if 'CP-' in texto:
+            return texto.replace('CP-', 'CP').replace(' ', '')
+        if 'cp' in texto.lower() and re.search(r'\bcp\d+\b', texto.lower()):
+            return re.sub(r'\bcp(\d+)\b', r'CP\1', texto, flags=re.IGNORECASE).replace(' ', '')
+        return texto.replace(' ', '')
 
     @staticmethod
     def extrair_ipv4(contact_uri: str) -> Optional[str]:
@@ -405,7 +459,7 @@ class KamailioDB:
         for ramal_bruto in ramais_brutos:
             try:
                 # Extrai dados básicos
-                numero_ramal = str(ramal_bruto['username'])
+                numero_ramal = DataParser.normalizar_numero_ramal(ramal_bruto.get('username'))
                 user_agent = ramal_bruto.get('user_agent', '')
                 contact = ramal_bruto.get('contact', '')
                 received = ramal_bruto.get('received', '')
@@ -436,6 +490,7 @@ class KamailioDB:
                 
                 # Faz parsing de marca/modelo
                 marca, modelo = DataParser.extrair_marca_modelo(user_agent)
+                modelo = DataParser.normalizar_modelo(user_agent, modelo)
                 
                 # Cria objeto RamalInfo
                 ramal = RamalInfo(

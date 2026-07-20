@@ -3,8 +3,12 @@
 Testes unitários para o módulo DataParser
 """
 
+import json
+import os
+import tempfile
 import unittest
-from kamailio_zabbix_sync import DataParser
+from datetime import datetime
+from kamailio_zabbix_sync import DataParser, RamalInfo, gerar_relatorio_inspecao, salvar_inspecao_json
 
 
 class TestExtrairIPv4(unittest.TestCase):
@@ -185,6 +189,105 @@ class TestExtrairMarcaModelo(unittest.TestCase):
         # Teste com variações de nome
         marca, _ = DataParser.extrair_marca_modelo("Intelbras IP 3000")
         self.assertEqual(marca, "INTELBRAS")
+
+
+class TestInspecaoDados(unittest.TestCase):
+    """Testes para o relatório de inspeção de dados brutos e parseados"""
+
+    def test_relatorio_inspecao_mostra_brutos_e_parseados(self):
+        """Gera um relatório com dados crus e parseados para inspeção manual"""
+        dados_brutos = [{
+            'username': '3000',
+            'contact': 'sip:3000@192.168.1.50:5060',
+            'received': 'sip:3000@192.168.1.50:5060',
+            'user_agent': 'Intelbras TIP125 v1.0',
+            'expires': '2026-07-20 12:00:00+00'
+        }]
+        dados_parseados = [RamalInfo(
+            numero_ramal='3000',
+            ip='192.168.1.50',
+            marca='INTELBRAS',
+            modelo='TIP125',
+            user_agent='Intelbras TIP125 v1.0',
+            expires='2026-07-20 12:00:00+00',
+            contact='sip:3000@192.168.1.50:5060'
+        )]
+
+        relatorio = gerar_relatorio_inspecao(dados_brutos, dados_parseados, [])
+
+        self.assertIn('Dados brutos retornados pelo banco', relatorio)
+        self.assertIn('username=3000', relatorio)
+        self.assertIn('Dados parseados', relatorio)
+        self.assertIn('Ramal 3000', relatorio)
+        self.assertIn('192.168.1.50', relatorio)
+
+
+class TestNormalizacaoDados(unittest.TestCase):
+    """Testes para normalização de ramal e modelo"""
+
+    def test_normaliza_numero_ramal_removendo_prefixos(self):
+        """Remove prefixos como 'Ramal' e 'c312' para deixar apenas o número do ramal"""
+        self.assertEqual(DataParser.normalizar_numero_ramal('Ramal 3000'), '3000')
+        self.assertEqual(DataParser.normalizar_numero_ramal('c312-3000'), '3000')
+        self.assertEqual(DataParser.normalizar_numero_ramal('c312-Ramal 3001'), '3001')
+        self.assertEqual(DataParser.normalizar_numero_ramal('SIP3001'), '3001')
+
+    def test_normaliza_modelo_removendo_versionamento(self):
+        """Remove versões de firmware e sufixos de versão do modelo"""
+        self.assertEqual(DataParser.normalizar_modelo('Intelbras TIP125 v1.0'), 'TIP125')
+        self.assertEqual(DataParser.normalizar_modelo('Yealink SIP-T31G 124.47.2.1.45 v1.0 (PCCW)'), 'T31G')
+        self.assertEqual(DataParser.normalizar_modelo('Grandstream GXP1625 1.0.11'), 'GXP1625')
+
+    def test_salvar_inspecao_json_cria_arquivo_com_dados_normalizados(self):
+        """Exporta inspeção para JSON com campos limpos para análise"""
+        dados_brutos = [{
+            'username': 'Ramal 3000',
+            'contact': 'sip:3000@192.168.1.50:5060',
+            'received': 'sip:3000@192.168.1.50:5060',
+            'user_agent': 'Yealink SIP-T31G 124.47.2.1.45 v1.0 (PCCW)',
+            'expires': '2026-07-20 12:00:00+00'
+        }]
+        dados_parseados = [RamalInfo(
+            numero_ramal='3000',
+            ip='192.168.1.50',
+            marca='YEALINK',
+            modelo='T31G',
+            user_agent='Yealink SIP-T31G 124.47.2.1.45 v1.0 (PCCW)',
+            expires='2026-07-20 12:00:00+00',
+            contact='sip:3000@192.168.1.50:5060'
+        )]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = os.path.join(tmpdir, 'inspecao.json')
+            salvar_inspecao_json(dados_brutos, dados_parseados, [], output_path=output_path)
+
+            with open(output_path, encoding='utf-8') as handle:
+                payload = json.load(handle)
+
+        self.assertEqual(payload['dados_parseados'][0]['numero_ramal'], '3000')
+        self.assertEqual(payload['dados_parseados'][0]['username'], '3000')
+        self.assertEqual(payload['dados_parseados'][0]['modelo'], 'T31G')
+        self.assertEqual(payload['dados_brutos'][0]['username'], 'Ramal 3000')
+        self.assertEqual(payload['dados_brutos'][0]['username_normalizado'], '3000')
+
+    def test_salvar_inspecao_json_converte_datetime_em_string(self):
+        """Converte valores datetime para string antes de gravar o JSON"""
+        dados_brutos = [{
+            'username': 'c312-1000',
+            'contact': 'sip:1000@192.168.1.10:5060',
+            'received': 'sip:1000@192.168.1.10:5060',
+            'user_agent': 'Yealink SIP-T20P 9.73.193.40',
+            'expires': datetime(2026, 7, 20, 12, 0, 0)
+        }]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = os.path.join(tmpdir, 'inspecao.json')
+            salvar_inspecao_json(dados_brutos, [], [], output_path=output_path)
+
+            with open(output_path, encoding='utf-8') as handle:
+                payload = json.load(handle)
+
+        self.assertEqual(payload['dados_brutos'][0]['expires'], '2026-07-20T12:00:00')
 
 
 class TestIntegracaoParsing(unittest.TestCase):
