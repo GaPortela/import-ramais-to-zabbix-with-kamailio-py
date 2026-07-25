@@ -148,6 +148,9 @@ class DataParser:
         'twinkle', 'softphone', 'mobile', 'app', 'client'
     ]
 
+    # Blacklist de IP's privados ou inválidos que não devem ser considerados
+    BLACKLIST_IPS = json.loads(os.getenv("BLACKLIST_IPS"))
+
     @staticmethod
     def normalizar_numero_ramal(valor: Optional[str]) -> str:
         """Normaliza o número do ramal removendo prefixos como c312 e mantendo somente o número do ramal."""
@@ -224,6 +227,8 @@ class DataParser:
             if match:
                 ip = match.group(0)
                 logger.debug(f"IPv4 extraído de '{contact_uri}': {ip}")
+                if DataParser.eh_ip_blacklist(ip):
+                    return None
                 return ip
             else:
                 logger.warning(f"Nenhum IPv4 encontrado em: {contact_uri}")
@@ -231,6 +236,26 @@ class DataParser:
         except Exception as e:
             logger.error(f"Erro ao extrair IPv4 de '{contact_uri}': {e}")
             return None
+
+    @staticmethod
+    def eh_ip_blacklist(ip: str) -> bool:
+        """
+        Verifica se o IP está na blacklist de IPs a serem ignorados.
+        
+        Args:
+            ip: String do IP a ser verificado
+            
+        Returns:
+            True se estiver na blacklist, False caso contrário
+        """
+        if not ip:
+            return False
+        
+        if ip in DataParser.BLACKLIST_IPS:
+            logger.info(f"IP {ip} está na blacklist e será ignorado")
+            return True
+        
+        return False
 
     @staticmethod
     def eh_softphone(user_agent: str) -> bool:
@@ -479,10 +504,10 @@ class KamailioDB:
                 ip = DataParser.extrair_ipv4(received) or DataParser.extrair_ipv4(contact)
                 
                 if not ip:
-                    logger.warning(f"Ramal {numero_ramal}: Não foi possível extrair IP de '{contact}' ou '{received}'")
+                    logger.warning(f"Ramal {numero_ramal}: IP não encontrado ou está na blacklist")
                     ramais_rejeitados.append({
                         'numero': numero_ramal,
-                        'motivo': 'IP não encontrado',
+                        'motivo': 'IP não encontrado ou está na blacklist',
                         'contact': contact,
                         'received': received
                     })
