@@ -18,6 +18,7 @@ import psycopg2
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
 
+from zabbix_utils import ZabbixAPI, ZabbixAPIError # Importa a biblioteca oficial do Zabbix para Python
 # ============================================================================
 # CONFIGURAÇÃO
 # ============================================================================
@@ -169,6 +170,9 @@ class DataParser:
         if numero.startswith('0') and len(numero) > 1:
             return numero.lstrip('0') or '0'
         return numero
+
+
+    # CRIAR DEF PARA LIMPAR PADRONIZAÇÃO DO HOSTNAME DEIXANDO SOMENTE NÚMERO DO RAMAL PARA COMPARAÇÃO AO REALIZAR ATUALIZAÇÃO DE HOST'S
 
     @staticmethod
     def normalizar_modelo(user_agent: Optional[str], modelo_extraido: Optional[str] = None) -> str:
@@ -561,156 +565,156 @@ class KamailioDB:
 # ============================================================================
 
 class ZabbixAPI:
-    """Classe para gerenciar integração com Zabbix via JSON-RPC API"""
-    
-    def __init__(self, config: Dict):
+    """Classe para gerenciar integração com Zabbix via zabbix-utils"""
+
+    # Definições de conexão
+    ZABBIX_URL=os.getenv('ZABBIX_URL', 'http://zabbix-web/zabbix/api_jsonrpc.php')
+    ZABBIX_API_TOKEN=os.getenv('ZABBIX_API_TOKEN') or None
+    ZABBIX_USER=os.getenv('ZABBIX_USER') or None
+    ZABBIX_PASSWORD=os.getenv('ZABBIX_PASSWORD') or None
+
+    # Definições de grupo e template
+    ZABBIX_GROUP_NAME=json.loads(os.getenv('ZABBIX_GROUP_NAME', 'Ramais'))
+    ZABBIX_TEMPLATE_NAME=json.loads(os.getenv('ZABBIX_TEMPLATE_NAME', '"ICMP Ping"'))
+    def __init__(self, url: str, api_token: Optional[str] = None, user: Optional[str] = None, password: Optional[str] = None, group_name: str = 'Ramais', template_name: str = 'ICMP Ping'):
         """
-        Inicializa conexão com Zabbix.
+        Inicializa a conexão com o Zabbix.
         
         Args:
-            config: Dicionário com:
-                - url: URL da API do Zabbix
-                - api_token: Token de API (recomendado)
-                - user: Usuário do Zabbix (alternativa se não houver token)
-                - password: Senha do Zabbix (alternativa se não houver token)
-                - group_name: Nome do grupo de hosts
-                - template_name: Nome do template a aplicar
+            url: URL do Zabbix API
+            api_token: Token de API (preferência)
+            user: Usuário (fallback)
+            password: Senha (fallback)
+            group_name: Nome do grupo de hosts
+            template_name: Nome do template a ser vinculado
         """
-        self.url = config.get('url')
-        self.api_token = config.get('api_token')
-        self.user = config.get('user')
-        self.password = config.get('password')
-        self.group_name = config.get('group_name')
-        self.template_name = config.get('template_name')
-        self.auth_token = None
-        self.session = None
-        
-        self._init_session()
+        self.url = url
+        self.api_token = api_token
+        self.user = user
+        self.password = password
+        self.group_name = group_name
+        self.template_name = template_name
+        self.zapi = None
     
-    def _init_session(self):
-        """Inicializa a sessão HTTP."""
-        import requests
-        self.session = requests.Session()
-        self.session.headers.update({'Content-Type': 'application/json'})
-    
-    def autenticar(self) -> bool:
-        """
-        Autentica com Zabbix usando token de API ou usuário/senha.
+    def _fazer_chamada_api(self, method: str, params: Dict) -> Any:
+        """Faz uma chamada genérica à API do Zabbix."""
+        if not self.zapi:
+            logger.error("ZabbixAPI não inicializado. Chame autenticar() primeiro.")
+            return None
         
-        Returns:
-            True se autenticado com sucesso, False caso contrário
-        """
         try:
-            # Tenta usar token de API (recomendado)
+            response = self.zapi.call(method, params)
+            return response
+        except ZabbixAPIError as e:
+            logger.error(f"Erro na chamada API '{method}': {e}")
+            return None
+
+    def autenticar(self, url: str = None, api_token: Optional[str] = None, user: Optional[str] = None, password: Optional[str] = None) -> bool:
+        """Autentica no Zabbix usando token de API ou usuário/senha."""
+        self.url = url or self.url
+        self.api_token = api_token or self.api_token
+        self.user = user or self.user
+        self.password = password or self.password
+        
+        try:
             if self.api_token:
-                logger.info("Autenticando no Zabbix com token de API")
-                self.auth_token = self.api_token
-                # Valida o token fazendo uma chamada simples
-                return self._validar_token()
-            
-            # Fallback: usa usuário e senha
+                logger.info("Autenticando no Zabbix via Token de API...")
+                self.zapi = ZabbixAPI(self.url, api_token=self.api_token)
             elif self.user and self.password:
-                logger.info("Autenticando no Zabbix com usuário/senha")
-                return self._autenticar_usuario_senha()
-            
+                logger.info("Autenticando no Zabbix via Usuário/Senha...")
+                self.zapi = ZabbixAPI(self.url, user=self.user, password=self.password)
             else:
-                logger.error("Nenhum método de autenticação fornecido (token ou usuário/senha)")
+                logger.error("Nenhum método de autenticação fornecido (Token ou Usuário/Senha)")
                 return False
-                
-        except Exception as e:
-            logger.error(f"Erro durante autenticação Zabbix: {e}")
-            return False
-    
-    def _validar_token(self) -> bool:
-        """Valida o token de API fazendo uma chamada simples."""
-        try:
-            payload = {
-                'jsonrpc': '2.0',
-                'method': 'apiinfo.version',
-                'auth': self.auth_token,
-                'id': 1
-            }
             
-            response = self.session.post(self.url, json=payload)
-            result = response.json()
-            
-            if 'result' in result:
-                logger.info(f"Token de API validado com sucesso. Zabbix versão: {result['result']}")
+            # Testa a conexão
+            version_info = self._fazer_chamada_api('apiinfo.version', {})
+            if version_info:
+                logger.info(f"Conexão com Zabbix bem-sucedida. Versão: {version_info}")
                 return True
-            elif 'error' in result:
-                logger.error(f"Erro de autenticação com token: {result['error']}")
+            else:
+                logger.error("Falha ao obter versão do Zabbix. Verifique credenciais.")
                 return False
             
-            return False
-            
         except Exception as e:
-            logger.error(f"Erro ao validar token: {e}")
+            logger.error(f"Erro na autenticação com Zabbix: {e}")
             return False
-    
-    def _autenticar_usuario_senha(self) -> bool:
-        """Autentica com usuário e senha (método legado)."""
+
+    def criar_host (self, hostname: str, ip: str, group_id: str, template_id: Optional[str] = None) -> bool:
+        """"Cria um host no Zabbix com os parâmetros fornecidos."""
+
+        # Definir campo para padrão de criação do hostname EX. ([EMPRESA]-[MARCA]-RAMAL [NUMERO])
+
         try:
-            payload = {
-                'jsonrpc': '2.0',
-                'method': 'user.login',
-                'params': {
-                    'username': self.user,
-                    'password': self.password
-                },
-                'id': 1
+            params = {
+                'host': hostname,
+                'name': hostname,
+                'interfaces': [{
+                    'type': 1,  # Zabbix agent
+                    'main': 1,
+                    'ip': ip,
+                    'port': '10050'
+                }],
+                'groups': [{'groupid': group_id}]
             }
             
-            response = self.session.post(self.url, json=payload)
-            result = response.json()
+            if template_id:
+                params['templates'] = [{'templateid': template_id}]
             
-            if 'result' in result:
-                self.auth_token = result['result']
-                logger.info("Autenticação com usuário/senha bem-sucedida")
+            result = self._fazer_chamada_api('host.create', params)
+            if result:
+                logger.info(f"Host '{hostname}' criado com sucesso no Zabbix")
                 return True
-            elif 'error' in result:
-                logger.error(f"Erro de autenticação: {result['error']}")
+            else:
+                logger.error(f"Falha ao criar host '{hostname}' no Zabbix")
                 return False
             
-            return False
-            
         except Exception as e:
-            logger.error(f"Erro ao autenticar com usuário/senha: {e}")
+            logger.error(f"Erro ao criar host '{hostname}': {e}")
             return False
-    
-    def _fazer_chamada_api(self, method: str, params: Dict = None) -> Optional[Dict]:
-        """
-        Faz uma chamada à API do Zabbix.
-        
-        Args:
-            method: Método da API (ex: 'host.create', 'host.update')
-            params: Parâmetros do método
-            
-        Returns:
-            Resultado da chamada ou None em caso de erro
-        """
+
+    def atualizar_host(self, hostname: str, ip: str, group_id: str, template_id: Optional[str] = None) -> bool:
+        """Atualiza um host existente no Zabbix com os novos parâmetros."""
         try:
-            payload = {
-                'jsonrpc': '2.0',
-                'method': method,
-                'params': params or {},
-                'auth': self.auth_token,
-                'id': 1
+            # Primeiro, obtém o ID do host pelo hostname
+
+            # LIMPAR PADRONIZAÇÃO DO HOSTNAME DEIXANDO SOMENTE NÚMERO DO RAMAL PARA FAZER A COMPARAÇÃO
+            result = self._fazer_chamada_api('host.get', {
+                'filter': {'host': hostname}
+            })
+            
+            if not result or len(result) == 0:
+                logger.warning(f"Host '{hostname}' não encontrado para atualização")
+                return False
+            
+            host_id = result[0]['hostid']
+            
+            params = {
+                'hostid': host_id,
+                'interfaces': [{
+                    'type': 1,  # Zabbix agent
+                    'main': 1,
+                    'ip': ip,
+                    'port': '10050'
+                }],
+                'groups': [{'groupid': group_id}]
             }
             
-            response = self.session.post(self.url, json=payload)
-            result = response.json()
+            if template_id:
+                params['templates'] = [{'templateid': template_id}]
             
-            if 'result' in result:
-                return result['result']
-            elif 'error' in result:
-                logger.error(f"Erro na chamada API {method}: {result['error']}")
-                return None
-            
-            return None
+            update_result = self._fazer_chamada_api('host.update', params)
+            if update_result:
+                logger.info(f"Host '{hostname}' atualizado com sucesso no Zabbix")
+                return True
+            else:
+                logger.error(f"Falha ao atualizar host '{hostname}' no Zabbix")
+                return False
             
         except Exception as e:
-            logger.error(f"Erro ao fazer chamada à API: {e}")
-            return None
+            logger.error(f"Erro ao atualizar host '{hostname}': {e}")
+            return False
+
     
     def obter_id_grupo(self, grupo_nome: str) -> Optional[str]:
         """Obtém o ID do grupo de hosts pelo nome."""
@@ -767,8 +771,7 @@ class ZabbixAPI:
         Returns:
             True se sincronização bem-sucedida, False caso contrário
         """
-        if not self.autenticar():
-            logger.error("Falha na autenticação com Zabbix")
+        if not self.autenticar(self.url, self.api_token, self.user, self.password):
             return False
         
         # Obtém IDs necessários
@@ -791,29 +794,21 @@ class ZabbixAPI:
                 hostname = f"RAMAL-{ramal.numero_ramal}"
                 
                 if self.host_existe(hostname):
-                    # Atualiza host existente
                     logger.debug(f"Atualizando host {hostname}")
-                    # Implementar atualização se necessário
-                    hosts_atualizados += 1
+                    # Atualiza host existente
+                    result = self.atualizar_host(hostname, ramal.ip, grupo_id, template_id)
+                    if result:
+                        logger.info(f"✓ Host atualizado: {hostname} ({ramal.ip})")
+                        hosts_atualizados += 1
+                    else:
+                        logger.error(f"✗ Erro ao atualizar host {hostname}")
+                        hosts_erro += 1
+
                 else:
+                    logger.debug(f"Criando host {hostname}")
                     # Cria novo host
-                    params = {
-                        'host': hostname,
-                        'name': f"Ramal {ramal.numero_ramal} ({ramal.marca} {ramal.modelo})",
-                        'groups': [{'groupid': grupo_id}],
-                        'interfaces': [{
-                            'type': 1,  # Zabbix agent
-                            'main': 1,
-                            'ip': ramal.ip,
-                            'port': '10050'
-                        }],
-                    }
-                    
-                    if template_id:
-                        params['templates'] = [{'templateid': template_id}]
-                    
-                    result = self._fazer_chamada_api('host.create', params)
-                    
+                    result = self.criar_host(hostname, ramal.ip, grupo_id, template_id)
+
                     if result:
                         logger.info(f"✓ Host criado: {hostname} ({ramal.ip})")
                         hosts_criados += 1

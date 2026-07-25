@@ -4,11 +4,8 @@
 # Banco de dados
 psycopg2-binary==2.9.9
 
-# API HTTP e JSON-RPC para Zabbix
-requests==2.31.0
-
-# Alternativa: pyzabbix (mais especializada para Zabbix)
-pyzabbix==1.3.1
+# Alternativa: zabbix-utils (biblioteca oficial do Zabbix para Python)
+zabbix-utils==2.0.4
 
 # Utilitários
 python-dotenv==1.0.0  # Para variáveis de ambiente
