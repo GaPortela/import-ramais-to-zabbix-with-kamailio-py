@@ -56,11 +56,13 @@ def build_zabbix_config() -> Dict[str, Optional[str]]:
     """Retorna configuração do Zabbix com defaults seguros."""
     return {
         'url': os.getenv('ZABBIX_URL', 'http://zabbix-web/zabbix/api_jsonrpc.php'),
-        'api_token': os.getenv('ZABBIX_API_TOKEN') or None,  # Preferência 1: Token de API
-        'user': os.getenv('ZABBIX_USER') or None,  # Preferência 2: Usuário (fallback)
-        'password': os.getenv('ZABBIX_PASSWORD') or None,  # Preferência 2: Senha (fallback)
+        'api_token': os.getenv('ZABBIX_API_TOKEN') or None,
+        'user': os.getenv('ZABBIX_USER') or None,
+        'password': os.getenv('ZABBIX_PASSWORD') or None,
         'group_name': os.getenv('ZABBIX_GROUP_NAME', 'Ramais'),
-        'template_name': os.getenv('ZABBIX_TEMPLATE_NAME', 'ICMP Ping')
+        'template_name': os.getenv('ZABBIX_TEMPLATE_NAME', 'ICMP Ping'),
+        # Nova configuração para o prefixo da organização
+        'host_prefix': os.getenv('HOST_PREFIX', 'ORGANIZACAO')
     }
 
 
@@ -149,10 +151,78 @@ class DataParser:
         'twinkle', 'softphone', 'mobile', 'app', 'client'
     ]
 
-    # Blacklist de IP's privados ou inválidos que não devem ser considerados
-    BLACKLIST_IPS = json.loads(os.getenv("BLACKLIST_IPS"))
+    # Atributo estático para armazenar o cache da blacklist
+    _BLACKLIST_IPS: Optional[List[str]] = None
+
+    @classmethod
+    def carregar_blacklist_ips(cls, caminho_arquivo: str = 'blacklist_ips.json') -> List[str]:
+        """Carrega e armazena em cache a blacklist a partir de arquivo JSON(blacklist_ips.json)."""
+        if cls._BLACKLIST_IPS is None:
+            if os.path.exists(caminho_arquivo):
+                try:
+                    with open(caminho_arquivo, 'r', encoding='utf-8') as f:
+                        dados = json.load(f)
+                        if isinstance(dados, list):
+                            cls._BLACKLIST_IPS = dados
+                        elif isinstance(dados, dict) and 'ips' in dados:
+                            cls._BLACKLIST_IPS = dados['ips']
+                        else:
+                            cls._BLACKLIST_IPS = []
+                except Exception as e:
+                    logger.error(f"Erro ao ler arquivo de blacklist {caminho_arquivo}: {e}")
+                    cls._BLACKLIST_IPS = []
+            else:
+                logger.warning(f"Arquivo de blacklist {caminho_arquivo} não encontrado. Nenhuma filtragem por blacklist será aplicada.")
+                cls._BLACKLIST_IPS = []
+        return cls._BLACKLIST_IPS
 
     @staticmethod
+    def extrair_ipv4(contact_uri: str) -> Optional[str]:
+        """Extrai o IPv4 de uma URI SIP usando Regex."""
+        if not contact_uri:
+            return None
+        
+        try:
+            match = re.search(DataParser.IPV4_REGEX, contact_uri)
+            if match:
+                ip = match.group(0)
+                logger.debug(f"IPv4 extraído de '{contact_uri}': {ip}")
+                return ip
+            else:
+                logger.warning(f"Nenhum IPv4 encontrado em: {contact_uri}")
+                return None
+        except Exception as e:
+            logger.error(f"Erro ao extrair IPv4 de '{contact_uri}': {e}")
+            return None
+
+    @classmethod
+    def filtrar_blacklist(cls, ramais: List['RamalInfo']) -> Tuple[List['RamalInfo'], List[Dict]]:
+        """
+        Filtra uma coleção completa de ramais parseados removendo aqueles que pertencem à blacklist.
+        
+        Returns:
+            Tupla (ramais_validos, ramais_rejeitados)
+        """
+        blacklist = cls.carregar_blacklist_ips()
+        if not blacklist:
+            return ramais, []
+
+        ramais_validos = []
+        ramais_rejeitados = []
+
+        for ramal in ramais:
+            if ramal.ip in blacklist:
+                logger.info(f"Ramal {ramal.numero_ramal} (IP: {ramal.ip}) rejeitado: IP está na blacklist")
+                ramais_rejeitados.append({
+                    'numero': ramal.numero_ramal,
+                    'motivo': f"IP {ramal.ip} na blacklist"
+                })
+            else:
+                ramais_validos.append(ramal)
+
+        return ramais_validos, ramais_rejeitados
+    @staticmethod
+
     def normalizar_numero_ramal(valor: Optional[str]) -> str:
         """Normaliza o número do ramal removendo prefixos como c312 e mantendo somente o número do ramal."""
         if not valor:
@@ -170,9 +240,6 @@ class DataParser:
         if numero.startswith('0') and len(numero) > 1:
             return numero.lstrip('0') or '0'
         return numero
-
-
-    # CRIAR DEF PARA LIMPAR PADRONIZAÇÃO DO HOSTNAME DEIXANDO SOMENTE NÚMERO DO RAMAL PARA COMPARAÇÃO AO REALIZAR ATUALIZAÇÃO DE HOST'S
 
     @staticmethod
     def normalizar_modelo(user_agent: Optional[str], modelo_extraido: Optional[str] = None) -> str:
@@ -207,39 +274,6 @@ class DataParser:
         if 'cp' in texto.lower() and re.search(r'\bcp\d+\b', texto.lower()):
             return re.sub(r'\bcp(\d+)\b', r'CP\1', texto, flags=re.IGNORECASE).replace(' ', '')
         return texto.replace(' ', '')
-
-    @staticmethod
-    def extrair_ipv4(contact_uri: str) -> Optional[str]:
-        """
-        Extrai o IPv4 de uma URI SIP usando Regex.
-        
-        Args:
-            contact_uri: String contendo a URI SIP (ex: "sip:3000@192.168.1.50:5060")
-            
-        Returns:
-            IP extraído (ex: "192.168.1.50") ou None se não encontrado
-            
-        Example:
-            >>> DataParser.extrair_ipv4("sip:3000@192.168.1.50:5060")
-            '192.168.1.50'
-        """
-        if not contact_uri:
-            return None
-        
-        try:
-            match = re.search(DataParser.IPV4_REGEX, contact_uri)
-            if match:
-                ip = match.group(0)
-                logger.debug(f"IPv4 extraído de '{contact_uri}': {ip}")
-                if DataParser.eh_ip_blacklist(ip):
-                    return None
-                return ip
-            else:
-                logger.warning(f"Nenhum IPv4 encontrado em: {contact_uri}")
-                return None
-        except Exception as e:
-            logger.error(f"Erro ao extrair IPv4 de '{contact_uri}': {e}")
-            return None
 
     @staticmethod
     def eh_ip_blacklist(ip: str) -> bool:
@@ -472,15 +506,9 @@ class KamailioDB:
             logger.error(f"Erro ao buscar ramais ativos: {e}")
             raise
 
-    def processar_ramais(self, ramais_brutos: List[Dict]) -> List[RamalInfo]:
+def processar_ramais(self, ramais_brutos: List[Dict]) -> List[RamalInfo]:
         """
-        Processa os dados brutos dos ramais, aplicando tratamentos.
-        
-        Args:
-            ramais_brutos: Lista de dicionários retornada do banco
-            
-        Returns:
-            Lista de objetos RamalInfo processados e filtrados
+        Processa os dados brutos dos ramais, aplicando tratamentos e filtrando por blacklist ao final.
         """
         ramais_processados = []
         ramais_rejeitados = []
@@ -508,10 +536,10 @@ class KamailioDB:
                 ip = DataParser.extrair_ipv4(received) or DataParser.extrair_ipv4(contact)
                 
                 if not ip:
-                    logger.warning(f"Ramal {numero_ramal}: IP não encontrado ou está na blacklist")
+                    logger.warning(f"Ramal {numero_ramal}: IP não encontrado")
                     ramais_rejeitados.append({
                         'numero': numero_ramal,
-                        'motivo': 'IP não encontrado ou está na blacklist',
+                        'motivo': 'IP não encontrado',
                         'contact': contact,
                         'received': received
                     })
@@ -543,12 +571,15 @@ class KamailioDB:
                     'erro': str(e)
                 })
                 continue
-        
+
+        # Filtragem pós-processamento da coleção completa via Blacklist
+        ramais_validos = DataParser.filtrar_blacklist(ramais_processados)
+
         # Log resumido
         logger.info(f"\n{'='*60}")
         logger.info(f"RESUMO DO PROCESSAMENTO")
         logger.info(f"{'='*60}")
-        logger.info(f"Ramais processados com sucesso: {len(ramais_processados)}")
+        logger.info(f"Ramais processados com sucesso: {len(ramais_validos)}")
         logger.info(f"Ramais rejeitados: {len(ramais_rejeitados)}")
         logger.info(f"{'='*60}\n")
         
@@ -557,8 +588,7 @@ class KamailioDB:
             for rejeitado in ramais_rejeitados:
                 logger.info(f"  - {rejeitado}")
         
-        return ramais_processados
-
+        return ramais_validos
 
 # ============================================================================
 # INTEGRAÇÃO COM ZABBIX API
@@ -567,235 +597,297 @@ class KamailioDB:
 class ZabbixAPI:
     """Classe para gerenciar integração com Zabbix via zabbix-utils"""
 
-    # Definições de conexão
-    ZABBIX_URL=os.getenv('ZABBIX_URL', 'http://zabbix-web/zabbix/api_jsonrpc.php')
-    ZABBIX_API_TOKEN=os.getenv('ZABBIX_API_TOKEN') or None
-    ZABBIX_USER=os.getenv('ZABBIX_USER') or None
-    ZABBIX_PASSWORD=os.getenv('ZABBIX_PASSWORD') or None
-
-    # Definições de grupo e template
-    ZABBIX_GROUP_NAME=json.loads(os.getenv('ZABBIX_GROUP_NAME', 'Ramais'))
-    ZABBIX_TEMPLATE_NAME=json.loads(os.getenv('ZABBIX_TEMPLATE_NAME', '"ICMP Ping"'))
-    def __init__(self, url: str, api_token: Optional[str] = None, user: Optional[str] = None, password: Optional[str] = None, group_name: str = 'Ramais', template_name: str = 'ICMP Ping'):
+    def __init__(
+        self,
+        url: str = None,
+        api_token: Optional[str] = None,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
+        group_name: str = 'Ramais',
+        template_name: str = 'ICMP Ping',
+        host_prefix: Optional[str] = None
+    ):
         """
         Inicializa a conexão com o Zabbix.
-        
-        Args:
-            url: URL do Zabbix API
-            api_token: Token de API (preferência)
-            user: Usuário (fallback)
-            password: Senha (fallback)
-            group_name: Nome do grupo de hosts
-            template_name: Nome do template a ser vinculado
         """
-        self.url = url
-        self.api_token = api_token
-        self.user = user
-        self.password = password
-        self.group_name = group_name
-        self.template_name = template_name
-        self.zapi = None
-    
-    def _fazer_chamada_api(self, method: str, params: Dict) -> Any:
-        """Faz uma chamada genérica à API do Zabbix."""
-        if not self.zapi:
-            logger.error("ZabbixAPI não inicializado. Chame autenticar() primeiro.")
-            return None
-        
-        try:
-            response = self.zapi.call(method, params)
-            return response
-        except ZabbixAPIError as e:
-            logger.error(f"Erro na chamada API '{method}': {e}")
-            return None
+        # Permite receber o dicionário ZABBIX_CONFIG no construtor
+        if isinstance(url, dict):
+            config = url
+            self.url = config.get('url')
+            self.api_token = config.get('api_token')
+            self.user = config.get('user')
+            self.password = config.get('password')
+            self.group_name = config.get('group_name', 'Ramais')
+            self.template_name = config.get('template_name', 'ICMP Ping')
+            self.host_prefix = config.get('host_prefix') or os.getenv('HOST_PREFIX', 'ORGANIZACAO')
+        else:
+            self.url = url or os.getenv('ZABBIX_URL', 'http://zabbix-web/zabbix/api_jsonrpc.php')
+            self.api_token = api_token or os.getenv('ZABBIX_API_TOKEN')
+            self.user = user or os.getenv('ZABBIX_USER')
+            self.password = password or os.getenv('ZABBIX_PASSWORD')
+            self.group_name = group_name
+            self.template_name = template_name
+            self.host_prefix = host_prefix or os.getenv('HOST_PREFIX', 'ORGANIZACAO')
 
-    def autenticar(self, url: str = None, api_token: Optional[str] = None, user: Optional[str] = None, password: Optional[str] = None) -> bool:
-        """Autentica no Zabbix usando token de API ou usuário/senha."""
+        self.zapi = None
+
+    # Método centralizado para formatar o hostname no padrão configurado
+    def gerar_hostname(self, ramal: RamalInfo) -> str:
+        """
+        Gera o nome visível/hostname do host padronizado:
+        <ORGANIZACAO>-<MARCA>-<MODELO>-RAMAL <NUMERO>
+        """
+        prefixo = (self.host_prefix or 'ORGANIZACAO').upper().strip()
+        marca = (ramal.marca or 'GENERICO').upper().strip()
+        modelo = (ramal.modelo or 'GENERICO').upper().strip()
+        numero = (ramal.numero_ramal or '').strip()
+
+        return f"{prefixo}-{marca}-{modelo}-RAMAL {numero}"
+
+    # Refatorado para usar nativamente a inicialização e autenticação da biblioteca zabbix-utils
+    def autenticar(
+        self,
+        url: str = None,
+        api_token: Optional[str] = None,
+        user: Optional[str] = None,
+        password: Optional[str] = None
+    ) -> bool:
+        """Autentica no Zabbix utilizando a biblioteca zabbix-utils."""
         self.url = url or self.url
         self.api_token = api_token or self.api_token
         self.user = user or self.user
         self.password = password or self.password
-        
+
         try:
             if self.api_token:
-                logger.info("Autenticando no Zabbix via Token de API...")
-                self.zapi = ZabbixAPI(self.url, api_token=self.api_token)
+                logger.info("Autenticando no Zabbix via Token de API (zabbix-utils)...")
+                # Instanciação direta usando zabbix-utils com Token
+                self.zapi = ZabbixAPIBase(url=self.url, token=self.api_token)
             elif self.user and self.password:
-                logger.info("Autenticando no Zabbix via Usuário/Senha...")
-                self.zapi = ZabbixAPI(self.url, user=self.user, password=self.password)
+                logger.info("Autenticando no Zabbix via Usuário/Senha (zabbix-utils)...")
+                # Instanciação e login direto usando zabbix-utils
+                self.zapi = ZabbixAPIBase(url=self.url, user=self.user, password=self.password)
             else:
                 logger.error("Nenhum método de autenticação fornecido (Token ou Usuário/Senha)")
                 return False
-            
-            # Testa a conexão
-            version_info = self._fazer_chamada_api('apiinfo.version', {})
+
+            # Teste de conexão/versão utilizando método nativo da biblioteca
+            version_info = self.zapi.api_version()
             if version_info:
-                logger.info(f"Conexão com Zabbix bem-sucedida. Versão: {version_info}")
+                logger.info(f"Conexão com Zabbix bem-sucedida. Versão API: {version_info}")
                 return True
-            else:
-                logger.error("Falha ao obter versão do Zabbix. Verifique credenciais.")
-                return False
-            
-        except Exception as e:
-            logger.error(f"Erro na autenticação com Zabbix: {e}")
+
+            logger.error("Falha ao obter versão do Zabbix. Verifique credenciais.")
             return False
 
-    def criar_host (self, hostname: str, ip: str, group_id: str, template_id: Optional[str] = None) -> bool:
-        """"Cria um host no Zabbix com os parâmetros fornecidos."""
+        except ZabbixAPIError as e:
+            logger.error(f"Erro na autenticação com Zabbix via zabbix-utils: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Erro inesperado na autenticação com Zabbix: {e}")
+            return False
 
-        # Definir campo para padrão de criação do hostname EX. ([EMPRESA]-[MARCA]-RAMAL [NUMERO])
+    def criar_host(self, hostname: str, ip: str, group_id: str, template_id: Optional[str] = None) -> bool:
+        """Cria um host no Zabbix utilizando zabbix-utils."""
+        if not self.zapi:
+            logger.error("ZabbixAPI não inicializado. Chame autenticar() primeiro.")
+            return False
 
         try:
             params = {
                 'host': hostname,
                 'name': hostname,
                 'interfaces': [{
-                    'type': 1,  # Zabbix agent
+                    'type': 1,  # Agent
                     'main': 1,
+                    'useip': 1,
                     'ip': ip,
+                    'dns': '',
                     'port': '10050'
                 }],
                 'groups': [{'groupid': group_id}]
             }
-            
+
             if template_id:
                 params['templates'] = [{'templateid': template_id}]
-            
-            result = self._fazer_chamada_api('host.create', params)
-            if result:
-                logger.info(f"Host '{hostname}' criado com sucesso no Zabbix")
+
+            result = self.zapi.host.create(**params)
+            if result and 'hostids' in result:
+                logger.info(f"Host '{hostname}' criado com sucesso no Zabbix (ID: {result['hostids'][0]})")
                 return True
-            else:
-                logger.error(f"Falha ao criar host '{hostname}' no Zabbix")
-                return False
-            
+
+            logger.error(f"Falha ao criar host '{hostname}' no Zabbix")
+            return False
+
+        except ZabbixAPIError as e:
+            logger.error(f"Erro ao criar host '{hostname}' via zabbix-utils: {e}")
+            return False
         except Exception as e:
-            logger.error(f"Erro ao criar host '{hostname}': {e}")
+            logger.error(f"Erro inesperado ao criar host '{hostname}': {e}")
             return False
 
     def atualizar_host(self, hostname: str, ip: str, group_id: str, template_id: Optional[str] = None) -> bool:
-        """Atualiza um host existente no Zabbix com os novos parâmetros."""
-        try:
-            # Primeiro, obtém o ID do host pelo hostname
+        """Atualiza a interface IP de um host existente no Zabbix utilizando zabbix-utils."""
+        if not self.zapi:
+            logger.error("ZabbixAPI não inicializado. Chame autenticar() primeiro.")
+            return False
 
-            # LIMPAR PADRONIZAÇÃO DO HOSTNAME DEIXANDO SOMENTE NÚMERO DO RAMAL PARA FAZER A COMPARAÇÃO
-            result = self._fazer_chamada_api('host.get', {
-                'filter': {'host': hostname}
-            })
-            
-            if not result or len(result) == 0:
+        try:
+            # Busca nativa via zabbix-utils filtrando pelo nome do host
+            hosts = self.zapi.host.get(
+                filter={'name': hostname},
+                selectInterfaces=['interfaceid', 'ip', 'main']
+            )
+
+            if not hosts:
+                # Fallback de busca pelo campo 'host' técnico caso divirja do 'name'
+                hosts = self.zapi.host.get(
+                    filter={'host': hostname},
+                    selectInterfaces=['interfaceid', 'ip', 'main']
+                )
+
+            if not hosts:
                 logger.warning(f"Host '{hostname}' não encontrado para atualização")
                 return False
-            
-            host_id = result[0]['hostid']
-            
+
+            host_id = hosts[0]['hostid']
+            interfaces = hosts[0].get('interfaces', [])
+
+            # Atualização das interfaces de rede utilizando o id existente quando disponível
+            if interfaces:
+                interface_id = interfaces[0]['interfaceid']
+                interface_params = [{
+                    'interfaceid': interface_id,
+                    'type': 1,
+                    'main': 1,
+                    'useip': 1,
+                    'ip': ip,
+                    'dns': '',
+                    'port': '10050'
+                }]
+            else:
+                interface_params = [{
+                    'type': 1,
+                    'main': 1,
+                    'useip': 1,
+                    'ip': ip,
+                    'dns': '',
+                    'port': '10050'
+                }]
+
             params = {
                 'hostid': host_id,
-                'interfaces': [{
-                    'type': 1,  # Zabbix agent
-                    'main': 1,
-                    'ip': ip,
-                    'port': '10050'
-                }],
+                'interfaces': interface_params,
                 'groups': [{'groupid': group_id}]
             }
-            
+
             if template_id:
                 params['templates'] = [{'templateid': template_id}]
-            
-            update_result = self._fazer_chamada_api('host.update', params)
-            if update_result:
+
+            # Atualização do host via zabbix-utils
+            update_result = self.zapi.host.update(**params)
+            if update_result and 'hostids' in update_result:
                 logger.info(f"Host '{hostname}' atualizado com sucesso no Zabbix")
                 return True
-            else:
-                logger.error(f"Falha ao atualizar host '{hostname}' no Zabbix")
-                return False
-            
-        except Exception as e:
-            logger.error(f"Erro ao atualizar host '{hostname}': {e}")
+
+            logger.error(f"Falha ao atualizar host '{hostname}' no Zabbix")
             return False
 
-    
+        except ZabbixAPIError as e:
+            logger.error(f"Erro ao atualizar host '{hostname}' via zabbix-utils: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Erro inesperado ao atualizar host '{hostname}': {e}")
+            return False
+
+    # Refatorado para consulta nativa do id do grupo via zabbix-utils
     def obter_id_grupo(self, grupo_nome: str) -> Optional[str]:
-        """Obtém o ID do grupo de hosts pelo nome."""
+        """Obtém o ID do grupo de hosts pelo nome utilizando zabbix-utils."""
+        if not self.zapi:
+            return None
+
         try:
-            result = self._fazer_chamada_api('hostgroup.get', {
-                'filter': {'name': grupo_nome}
-            })
-            
+            result = self.zapi.hostgroup.get(filter={'name': grupo_nome})
             if result and len(result) > 0:
                 return result[0]['groupid']
-            
-            logger.warning(f"Grupo '{grupo_nome}' não encontrado")
+
+            logger.warning(f"Grupo '{grupo_nome}' não encontrado no Zabbix")
             return None
-            
-        except Exception as e:
-            logger.error(f"Erro ao obter ID do grupo: {e}")
+
+        except ZabbixAPIError as e:
+            logger.error(f"Erro ao obter ID do grupo '{grupo_nome}' via zabbix-utils: {e}")
             return None
-    
+
+    # Refatorado para consulta nativa do id do template via zabbix-utils
     def obter_id_template(self, template_nome: str) -> Optional[str]:
-        """Obtém o ID do template pelo nome."""
+        """Obtém o ID do template pelo nome utilizando zabbix-utils."""
+        if not self.zapi:
+            return None
+
         try:
-            result = self._fazer_chamada_api('template.get', {
-                'filter': {'name': template_nome}
-            })
-            
+            result = self.zapi.template.get(filter={'name': template_nome})
             if result and len(result) > 0:
                 return result[0]['templateid']
-            
-            logger.warning(f"Template '{template_nome}' não encontrado")
+
+            # Fallback buscando pelo campo 'host' do template
+            result = self.zapi.template.get(filter={'host': template_nome})
+            if result and len(result) > 0:
+                return result[0]['templateid']
+
+            logger.warning(f"Template '{template_nome}' não encontrado no Zabbix")
             return None
-            
-        except Exception as e:
-            logger.error(f"Erro ao obter ID do template: {e}")
+
+        except ZabbixAPIError as e:
+            logger.error(f"Erro ao obter ID do template '{template_nome}' via zabbix-utils: {e}")
             return None
-    
+
+    # Refatorado para verificação nativa de existência do host por nome ou ID
     def host_existe(self, hostname: str) -> bool:
-        """Verifica se um host já existe no Zabbix."""
-        try:
-            result = self._fazer_chamada_api('host.get', {
-                'filter': {'name': hostname}
-            })
-            return bool(result and len(result) > 0)
-        except Exception as e:
-            logger.error(f"Erro ao verificar existência do host: {e}")
+        """Verifica se um host existe no Zabbix utilizando zabbix-utils."""
+        if not self.zapi:
             return False
-    
+
+        try:
+            result = self.zapi.host.get(filter={'name': hostname})
+            if result and len(result) > 0:
+                return True
+
+            result_host = self.zapi.host.get(filter={'host': hostname})
+            return bool(result_host and len(result_host) > 0)
+
+        except ZabbixAPIError as e:
+            logger.error(f"Erro ao verificar existência do host '{hostname}' via zabbix-utils: {e}")
+            return False
+
+    # Atualizado para utilizar o novo padrão de hostname gerado pelo método centralizado
     def sincronizar_ramais(self, ramais: List[RamalInfo]) -> bool:
         """
         Sincroniza lista de ramais com Zabbix.
-        
-        Args:
-            ramais: Lista de objetos RamalInfo
-            
-        Returns:
-            True se sincronização bem-sucedida, False caso contrário
         """
-        if not self.autenticar(self.url, self.api_token, self.user, self.password):
+        if not self.autenticar():
             return False
-        
-        # Obtém IDs necessários
+
         grupo_id = self.obter_id_grupo(self.group_name)
         template_id = self.obter_id_template(self.template_name)
-        
+
         if not grupo_id:
             logger.error(f"Não foi possível obter ID do grupo '{self.group_name}'")
             return False
-        
+
         if not template_id:
             logger.warning(f"Template '{self.template_name}' não encontrado. Criando hosts sem template.")
-        
+
         hosts_criados = 0
         hosts_atualizados = 0
         hosts_erro = 0
-        
+
         for ramal in ramais:
             try:
-                hostname = f"RAMAL-{ramal.numero_ramal}"
-                
+                # Chamada para a montagem padronizada do hostname
+                hostname = self.gerar_hostname(ramal)
+
                 if self.host_existe(hostname):
                     logger.debug(f"Atualizando host {hostname}")
-                    # Atualiza host existente
                     result = self.atualizar_host(hostname, ramal.ip, grupo_id, template_id)
                     if result:
                         logger.info(f"✓ Host atualizado: {hostname} ({ramal.ip})")
@@ -803,25 +895,21 @@ class ZabbixAPI:
                     else:
                         logger.error(f"✗ Erro ao atualizar host {hostname}")
                         hosts_erro += 1
-
                 else:
                     logger.debug(f"Criando host {hostname}")
-                    # Cria novo host
                     result = self.criar_host(hostname, ramal.ip, grupo_id, template_id)
-
                     if result:
                         logger.info(f"✓ Host criado: {hostname} ({ramal.ip})")
                         hosts_criados += 1
                     else:
                         logger.error(f"✗ Erro ao criar host {hostname}")
                         hosts_erro += 1
-                        
+
             except Exception as e:
                 logger.error(f"Erro ao processar ramal {ramal.numero_ramal}: {e}")
                 hosts_erro += 1
                 continue
-        
-        # Log resumido
+
         logger.info(f"\n{'='*60}")
         logger.info(f"SINCRONIZAÇÃO COM ZABBIX CONCLUÍDA")
         logger.info(f"{'='*60}")
@@ -829,7 +917,7 @@ class ZabbixAPI:
         logger.info(f"Hosts atualizados: {hosts_atualizados}")
         logger.info(f"Erros: {hosts_erro}")
         logger.info(f"{'='*60}\n")
-        
+
         return hosts_erro == 0
 
 
