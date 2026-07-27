@@ -71,6 +71,7 @@ inspecao_ramal.json
 .env.*.local
 *.env.example.bak
 config.local.py
+blacklist_ips.json
 
 # ============================================================================
 # LOGS
@@ -142,3 +143,4 @@ coverage.xml
 # - test_data_parser.py    (testes)
 # - Makefile               (automação)
 # - setup.sh               (setup automático)
+
