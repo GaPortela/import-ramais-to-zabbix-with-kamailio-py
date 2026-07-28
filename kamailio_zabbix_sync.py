@@ -18,7 +18,7 @@ import psycopg2
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
 
-from zabbix_utils import ZabbixAPI, ZabbixAPIError # Importa a biblioteca oficial do Zabbix para Python
+from zabbix_utils import ZabbixAPI as ZabbixAPIClient
 # ============================================================================
 # CONFIGURAÇÃO
 # ============================================================================
@@ -289,7 +289,7 @@ class DataParser:
         if not ip:
             return False
         
-        if ip in DataParser.BLACKLIST_IPS:
+        if ip in DataParser.carregar_blacklist_ips():
             logger.info(f"IP {ip} está na blacklist e será ignorado")
             return True
         
@@ -506,7 +506,7 @@ class KamailioDB:
             logger.error(f"Erro ao buscar ramais ativos: {e}")
             raise
 
-def processar_ramais(self, ramais_brutos: List[Dict]) -> List[RamalInfo]:
+    def processar_ramais(self, ramais_brutos: List[Dict]) -> List[RamalInfo]:
         """
         Processa os dados brutos dos ramais, aplicando tratamentos e filtrando por blacklist ao final.
         """
@@ -573,7 +573,8 @@ def processar_ramais(self, ramais_brutos: List[Dict]) -> List[RamalInfo]:
                 continue
 
         # Filtragem pós-processamento da coleção completa via Blacklist
-        ramais_validos = DataParser.filtrar_blacklist(ramais_processados)
+        ramais_validos, rejeitados_blacklist = DataParser.filtrar_blacklist(ramais_processados)
+        ramais_rejeitados.extend(rejeitados_blacklist)
 
         # Log resumido
         logger.info(f"\n{'='*60}")
@@ -659,16 +660,17 @@ class ZabbixAPI:
         self.password = password or self.password
 
         try:
+            self.zapi = ZabbixAPIClient(url=self.url)
+
             if self.api_token:
                 logger.info("Autenticando no Zabbix via Token de API (zabbix-utils)...")
-                # Instanciação direta usando zabbix-utils com Token
-                self.zapi = ZabbixAPIBase(url=self.url, token=self.api_token)
+                self.zapi.login(token=self.api_token)
             elif self.user and self.password:
                 logger.info("Autenticando no Zabbix via Usuário/Senha (zabbix-utils)...")
-                # Instanciação e login direto usando zabbix-utils
-                self.zapi = ZabbixAPIBase(url=self.url, user=self.user, password=self.password)
+                self.zapi.login(user=self.user, password=self.password)
             else:
                 logger.error("Nenhum método de autenticação fornecido (Token ou Usuário/Senha)")
+                self.zapi = None
                 return False
 
             # Teste de conexão/versão utilizando método nativo da biblioteca
@@ -680,9 +682,6 @@ class ZabbixAPI:
             logger.error("Falha ao obter versão do Zabbix. Verifique credenciais.")
             return False
 
-        except ZabbixAPIError as e:
-            logger.error(f"Erro na autenticação com Zabbix via zabbix-utils: {e}")
-            return False
         except Exception as e:
             logger.error(f"Erro inesperado na autenticação com Zabbix: {e}")
             return False
@@ -719,9 +718,6 @@ class ZabbixAPI:
             logger.error(f"Falha ao criar host '{hostname}' no Zabbix")
             return False
 
-        except ZabbixAPIError as e:
-            logger.error(f"Erro ao criar host '{hostname}' via zabbix-utils: {e}")
-            return False
         except Exception as e:
             logger.error(f"Erro inesperado ao criar host '{hostname}': {e}")
             return False
@@ -793,9 +789,6 @@ class ZabbixAPI:
             logger.error(f"Falha ao atualizar host '{hostname}' no Zabbix")
             return False
 
-        except ZabbixAPIError as e:
-            logger.error(f"Erro ao atualizar host '{hostname}' via zabbix-utils: {e}")
-            return False
         except Exception as e:
             logger.error(f"Erro inesperado ao atualizar host '{hostname}': {e}")
             return False
@@ -814,7 +807,7 @@ class ZabbixAPI:
             logger.warning(f"Grupo '{grupo_nome}' não encontrado no Zabbix")
             return None
 
-        except ZabbixAPIError as e:
+        except Exception as e:
             logger.error(f"Erro ao obter ID do grupo '{grupo_nome}' via zabbix-utils: {e}")
             return None
 
@@ -837,7 +830,7 @@ class ZabbixAPI:
             logger.warning(f"Template '{template_nome}' não encontrado no Zabbix")
             return None
 
-        except ZabbixAPIError as e:
+        except Exception as e:
             logger.error(f"Erro ao obter ID do template '{template_nome}' via zabbix-utils: {e}")
             return None
 
@@ -855,7 +848,7 @@ class ZabbixAPI:
             result_host = self.zapi.host.get(filter={'host': hostname})
             return bool(result_host and len(result_host) > 0)
 
-        except ZabbixAPIError as e:
+        except Exception as e:
             logger.error(f"Erro ao verificar existência do host '{hostname}' via zabbix-utils: {e}")
             return False
 

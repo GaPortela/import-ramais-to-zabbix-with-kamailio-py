@@ -5,5 +5,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.log
+.env
+.env.*
 .git/
 htmlcov/

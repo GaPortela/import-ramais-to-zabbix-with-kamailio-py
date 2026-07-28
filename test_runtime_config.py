@@ -2,7 +2,14 @@ import os
 import unittest
 from unittest.mock import patch
 
-from kamailio_zabbix_sync import build_db_config, build_zabbix_config
+from kamailio_zabbix_sync import (
+    DataParser,
+    KamailioDB,
+    RamalInfo,
+    ZabbixAPI,
+    build_db_config,
+    build_zabbix_config,
+)
 
 
 class TestRuntimeConfig(unittest.TestCase):
@@ -52,6 +59,35 @@ class TestRuntimeConfig(unittest.TestCase):
             self.assertIsNone(config["password"])
             self.assertEqual(config["group_name"], "Ramais")
             self.assertEqual(config["template_name"], "ICMP Ping")
+
+
+class TestStabilizedContracts(unittest.TestCase):
+    def setUp(self):
+        DataParser._BLACKLIST_IPS = []
+
+    def test_processar_ramais_permanece_metodo_do_repositorio(self):
+        db = KamailioDB({})
+        result = db.processar_ramais([{
+            "username": "3000",
+            "contact": "sip:3000@192.168.1.50:5060",
+            "received": "",
+            "user_agent": "Intelbras TIP125 v1.0",
+            "expires": "2026-07-20T12:00:00",
+        }])
+
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], RamalInfo)
+        self.assertEqual(result[0].ip, "192.168.1.50")
+
+    def test_autenticacao_token_usa_cliente_zabbix_utils(self):
+        with patch("kamailio_zabbix_sync.ZabbixAPIClient") as client_factory:
+            client = client_factory.return_value
+            client.api_version.return_value = "7.0.0"
+            api = ZabbixAPI({"url": "http://zabbix/api_jsonrpc.php", "api_token": "token"})
+
+            self.assertTrue(api.autenticar())
+            client_factory.assert_called_once_with(url="http://zabbix/api_jsonrpc.php")
+            client.login.assert_called_once_with(token="token")
 
 
 if __name__ == "__main__":
