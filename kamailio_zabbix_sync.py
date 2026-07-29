@@ -9,8 +9,9 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
+from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
 
@@ -140,9 +141,63 @@ class SyncPlan:
     """Plano imutável em intenção: decisões separadas da execução na API."""
     actions: List[SyncAction]
     hosts_found: int = 0
+    inconsistencies: List[str] = field(default_factory=list)
 
     def count(self, action: str) -> int:
         return sum(item.action == action for item in self.actions)
+
+    @property
+    def is_valid(self) -> bool:
+        """Indica se o plano pode ser aplicado sem ambiguidade de identidade."""
+        return not self.validate()
+
+    def validate(self) -> List[str]:
+        """Retorna todas as inconsistências que impedem uma execução atômica."""
+        issues = list(self.inconsistencies)
+        issues.extend(item.reason for item in self.actions
+                      if item.action == 'invalid' and item.reason)
+        return issues
+
+
+@dataclass
+class SyncReport:
+    """Resultado único da sincronização, compartilhado por dry-run e execução real."""
+    records_read: int = 0
+    valid_records: int = 0
+    ignored_records: int = 0
+    hosts_found: int = 0
+    created: int = 0
+    updated: int = 0
+    errors: int = 0
+    dry_run: bool = False
+    plan: Optional[SyncPlan] = None
+    inconsistencies: List[str] = field(default_factory=list)
+    duration_seconds: float = 0.0
+    _started_at: float = field(default_factory=perf_counter, repr=False)
+
+    def finalize(self) -> 'SyncReport':
+        self.duration_seconds = perf_counter() - self._started_at
+        return self
+
+    def format(self) -> str:
+        mode = ' (DRY-RUN)' if self.dry_run else ''
+        lines = [
+            f"RELATÓRIO FINAL{mode}: lidos={self.records_read} "
+            f"válidos={self.valid_records} ignorados={self.ignored_records} "
+            f"encontrados={self.hosts_found} criados={self.created} "
+            f"atualizados={self.updated} erros={self.errors} "
+            f"tempo={self.duration_seconds:.3f}s"
+        ]
+        if self.plan:
+            lines.append('PLANO:')
+            for action in self.plan.actions:
+                numero = action.ramal.numero_ramal
+                suffix = f" - {action.reason}" if action.reason else ''
+                lines.append(f"{action.action.upper()} ramal {numero}{suffix}")
+        if self.inconsistencies:
+            lines.append('INCONSISTÊNCIAS:')
+            lines.extend(f"- {issue}" for issue in self.inconsistencies)
+        return '\n'.join(lines)
 
 
 # ============================================================================
@@ -634,30 +689,40 @@ class KamailioDB:
 # ============================================================================
 
 class SyncPlanner:
-    """Decide ações exclusivamente a partir da identidade estável e do catálogo lido."""
+    """Decide ações exclusivamente a partir da identidade estável e do catálogo lido.
+
+    A tag ``ramal`` é o único identificador persistente: é pesquisável pela API
+    e não mistura identidade com a descrição ou demais atributos do host.
+    """
 
     @staticmethod
     def build(ramais: List[RamalInfo], hosts: List[Dict[str, Any]], tag_name: str) -> SyncPlan:
         index: Dict[str, List[Dict[str, Any]]] = {}
+        inconsistencies: List[str] = []
         for host in hosts:
-            numeros = set()
-            for tag in host.get('tags', []):
-                if tag.get('tag') == tag_name:
-                    numero = DataParser.normalizar_numero_ramal(tag.get('value'))
-                    if numero:
-                        numeros.add(numero)
-            tecnico = re.fullmatch(r'ramal-(\d+)', str(host.get('host', '')), re.IGNORECASE)
-            if tecnico:
-                numeros.add(tecnico.group(1))
-            for numero in numeros:
-                index.setdefault(numero, []).append(host)
+            tags = [tag for tag in host.get('tags', []) if tag.get('tag') == tag_name]
+            host_label = host.get('hostid') or host.get('host') or '<desconhecido>'
+            if len(tags) != 1:
+                inconsistencies.append(
+                    f"Host {host_label} deve possuir exatamente uma tag '{tag_name}'"
+                )
+                continue
+            numero = DataParser.normalizar_numero_ramal(tags[0].get('value'))
+            if not numero:
+                inconsistencies.append(f"Host {host_label} possui valor inválido na tag '{tag_name}'")
+                continue
+            index.setdefault(numero, []).append(host)
 
         actions: List[SyncAction] = []
         seen = set()
         for ramal in ramais:
             numero = DataParser.normalizar_numero_ramal(ramal.numero_ramal)
-            if not numero or numero in seen:
-                actions.append(SyncAction('invalid', ramal, reason='ramal vazio ou duplicado na origem'))
+            if not numero:
+                actions.append(SyncAction('invalid', ramal, reason='ramal vazio na origem'))
+                continue
+            if numero in seen:
+                actions.append(SyncAction('invalid', ramal,
+                                          reason=f'ramal duplicado na origem: {numero}'))
                 continue
             seen.add(numero)
             candidates = index.get(numero, [])
@@ -667,7 +732,7 @@ class SyncPlanner:
                 actions.append(SyncAction('update', ramal, host=candidates[0]))
             else:
                 actions.append(SyncAction('create', ramal))
-        return SyncPlan(actions=actions, hosts_found=len(hosts))
+        return SyncPlan(actions=actions, hosts_found=len(hosts), inconsistencies=inconsistencies)
 
 
 class ZabbixPlanExecutor:
@@ -679,10 +744,15 @@ class ZabbixPlanExecutor:
         self.template_id = template_id
 
     def execute(self, plan: SyncPlan) -> int:
-        errors = plan.count('invalid')
+        issues = plan.validate()
+        if issues:
+            logger.error('Plano inválido; nenhuma ação será enviada ao Zabbix.')
+            for issue in issues:
+                logger.error('Inconsistência: %s', issue)
+            return len(issues)
+
+        errors = 0
         for item in plan.actions:
-            if item.action == 'invalid':
-                continue
             try:
                 if item.action == 'create':
                     success = self.client.criar_host(item.ramal, self.group_id, self.template_id)
@@ -731,7 +801,7 @@ class ZabbixAPI:
             self.host_prefix = host_prefix or os.getenv('HOST_PREFIX', 'ORGANIZACAO')
 
         self.zapi = None
-        self.last_summary: Dict[str, Any] = {}
+        self.last_report = SyncReport()
 
     RAMAL_TAG = 'ramal'
 
@@ -942,20 +1012,38 @@ class ZabbixAPI:
             logger.error(f"Erro ao obter ID do template '{template_nome}' via zabbix-utils: {e}")
             return None
 
-    def _catalogar_hosts(self, group_id: str) -> List[Dict[str, Any]]:
-        """Carrega o grupo uma única vez para busca escalável por identidade estável."""
+    def _catalogar_hosts(self) -> List[Dict[str, Any]]:
+        """Busca hosts gerenciados exclusivamente pela tag persistente do ramal."""
         return self.zapi.host.get(
-            groupids=[group_id], output=['hostid', 'host', 'name'],
+            tags=[{'tag': self.RAMAL_TAG}], output=['hostid', 'host', 'name'],
             selectInterfaces=['interfaceid', 'ip', 'main'], selectTags='extend'
         ) or []
 
-    def planejar_sincronizacao(self, ramais: List[RamalInfo], group_id: str) -> SyncPlan:
-        """Consulta o catálogo e delega a decisão a um planejador sem efeitos colaterais."""
-        return SyncPlanner.build(ramais, self._catalogar_hosts(group_id), self.RAMAL_TAG)
+    def planejar_sincronizacao(self, ramais: List[RamalInfo]) -> SyncPlan:
+        """Consulta o catálogo por tag e delega a decisão ao planejador puro."""
+        return SyncPlanner.build(ramais, self._catalogar_hosts(), self.RAMAL_TAG)
 
-    def sincronizar_ramais(self, ramais: List[RamalInfo], dry_run: bool = False) -> bool:
+    def sincronizar_ramais(self, ramais: List[RamalInfo], dry_run: bool = False,
+                           report: Optional[SyncReport] = None) -> bool:
         """Sincroniza por identidade persistente; no dry-run apenas produz o plano."""
+        report = report or SyncReport(dry_run=dry_run)
+        report.dry_run = dry_run
+        self.last_report = report
+
+        # Validação independente da API: duplicidades e ramais inválidos são
+        # rejeitados antes mesmo da primeira chamada ao Zabbix.
+        source_plan = SyncPlanner.build(ramais, [], self.RAMAL_TAG)
+        if not source_plan.is_valid:
+            report.plan = source_plan
+            report.created = source_plan.count('create')
+            report.updated = source_plan.count('update')
+            report.inconsistencies = source_plan.validate()
+            report.errors = len(report.inconsistencies)
+            logger.error('Plano de origem inválido; nenhuma chamada ao Zabbix será realizada.')
+            return False
+
         if not self.autenticar():
+            report.errors = 1
             return False
 
         grupo_id = self.obter_id_grupo(self.group_name)
@@ -963,13 +1051,18 @@ class ZabbixAPI:
 
         if not grupo_id:
             logger.error(f"Não foi possível obter ID do grupo '{self.group_name}'")
+            report.errors = 1
             return False
 
         if not template_id:
             logger.warning(f"Template '{self.template_name}' não encontrado. Criando hosts sem template.")
 
-        plano = self.planejar_sincronizacao(ramais, grupo_id)
-        contagem = {acao: plano.count(acao) for acao in ('create', 'update', 'invalid')}
+        plano = self.planejar_sincronizacao(ramais)
+        report.plan = plano
+        report.hosts_found = plano.hosts_found
+        report.created = plano.count('create')
+        report.updated = plano.count('update')
+        report.inconsistencies = plano.validate()
         for item in plano.actions:
             if item.action == 'invalid':
                 logger.error("Ramal %s: %s", item.ramal.numero_ramal, item.reason)
@@ -978,22 +1071,28 @@ class ZabbixAPI:
 
         if dry_run:
             logger.info("DRY-RUN: criaria=%s atualizaria=%s inconsistentes=%s",
-                        contagem['create'], contagem['update'], contagem['invalid'])
-            self.last_summary = {'hosts_found': plano.hosts_found, **contagem, 'errors': contagem['invalid'], 'dry_run': True}
-            return contagem['invalid'] == 0
+                        report.created, report.updated, len(report.inconsistencies))
+            report.errors = len(report.inconsistencies)
+            return plano.is_valid
 
-        hosts_erro = ZabbixPlanExecutor(self, grupo_id, template_id).execute(plano)
-        self.last_summary = {'hosts_found': plano.hosts_found, **contagem, 'errors': hosts_erro, 'dry_run': False}
+        # O executor só pode receber um plano inteiramente validado. Assim,
+        # nenhuma alteração parcial é enviada quando há identidade ambígua.
+        if not plano.is_valid:
+            logger.error('Plano de sincronização inválido; nenhuma alteração será enviada ao Zabbix.')
+            report.errors = len(report.inconsistencies)
+            return False
+
+        report.errors = ZabbixPlanExecutor(self, grupo_id, template_id).execute(plano)
 
         logger.info(f"\n{'='*60}")
         logger.info(f"SINCRONIZAÇÃO COM ZABBIX CONCLUÍDA")
         logger.info(f"{'='*60}")
-        logger.info(f"Hosts criados: {contagem['create']}")
-        logger.info(f"Hosts atualizados: {contagem['update']}")
-        logger.info(f"Erros: {hosts_erro}")
+        logger.info(f"Hosts criados: {report.created}")
+        logger.info(f"Hosts atualizados: {report.updated}")
+        logger.info(f"Erros: {report.errors}")
         logger.info(f"{'='*60}\n")
 
-        return hosts_erro == 0
+        return report.errors == 0
 
 
 # ============================================================================
@@ -1092,10 +1191,9 @@ def salvar_inspecao_json(ramais_brutos: List[Dict], ramais_processados: List[Ram
 
 def main(dry_run: Optional[bool] = None, apenas_inspecao: bool = False):
     """Função principal de orquestração."""
-    started_at = datetime.now()
-
     if dry_run is None:
         dry_run = parse_bool(os.getenv('DRY_RUN', 'False'))
+    report = SyncReport(dry_run=dry_run)
 
     logger.info("Iniciando sincronização Kamailio → Zabbix")
     logger.info(f"Timestamp: {datetime.now().isoformat()}\n")
@@ -1151,15 +1249,14 @@ def main(dry_run: Optional[bool] = None, apenas_inspecao: bool = False):
         # Sincroniza ramais com Zabbix
         logger.info(f"\nSincronizando {len(ramais_processados)} ramais com Zabbix...")
         zabbix = ZabbixAPI(ZABBIX_CONFIG)
-        resultado_sync = zabbix.sincronizar_ramais(ramais_processados, dry_run=dry_run)
-        summary = zabbix.last_summary
-        logger.info(
-            "RELATÓRIO FINAL%s: lidos=%s válidos=%s ignorados=%s encontrados=%s criados=%s atualizados=%s erros=%s tempo=%s",
-            ' (DRY-RUN)' if dry_run else '', len(ramais_brutos), len(ramais_processados),
-            len(ramais_brutos) - len(ramais_processados), summary.get('hosts_found', 0),
-            summary.get('create', 0), summary.get('update', 0), summary.get('errors', 0),
-            datetime.now() - started_at,
+        report.records_read = len(ramais_brutos)
+        report.valid_records = len(ramais_processados)
+        report.ignored_records = len(ramais_brutos) - len(ramais_processados)
+        resultado_sync = zabbix.sincronizar_ramais(
+            ramais_processados, dry_run=dry_run, report=report
         )
+        report.finalize()
+        logger.info(report.format())
 
         return resultado_sync
         

@@ -2,7 +2,16 @@ import os
 import unittest
 from unittest.mock import patch
 
-from kamailio_zabbix_sync import RamalInfo, SyncPlanner, ZabbixAPI, get_development_limit
+from kamailio_zabbix_sync import (
+    RamalInfo,
+    SyncAction,
+    SyncPlan,
+    SyncPlanner,
+    SyncReport,
+    ZabbixAPI,
+    ZabbixPlanExecutor,
+    get_development_limit,
+)
 
 
 def ramal(numero='3000', ip='10.0.0.10', marca='INTELBRAS', modelo='TIP125', ua='Intelbras TIP125'):
@@ -12,10 +21,12 @@ def ramal(numero='3000', ip='10.0.0.10', marca='INTELBRAS', modelo='TIP125', ua=
 class FakeHostAPI:
     def __init__(self, hosts):
         self.hosts = hosts
+        self.get_calls = []
         self.creates = []
         self.updates = []
 
     def get(self, **kwargs):
+        self.get_calls.append(kwargs)
         return self.hosts
 
     def create(self, **kwargs):
@@ -34,7 +45,10 @@ class FakeZabbix:
 
 class TestStableIdentity(unittest.TestCase):
     def make_api(self, hosts):
-        api = ZabbixAPI({'url': 'http://zabbix', 'group_name': 'Ramais'})
+        api = ZabbixAPI({
+            'url': 'http://zabbix', 'group_name': 'Ramais',
+            'host_prefix': 'ORGANIZACAO',
+        })
         api.zapi = FakeZabbix(hosts)
         api.autenticar = lambda: True
         api.obter_id_grupo = lambda _: '1'
@@ -81,6 +95,30 @@ class TestStableIdentity(unittest.TestCase):
 
         self.assertFalse(api.sincronizar_ramais([ramal()], dry_run=True))
 
+    def test_hostname_without_persistent_tag_is_not_identity(self):
+        host = dict(self.tagged_host(), tags=[])
+        plan = SyncPlanner.build([ramal()], [host], 'ramal')
+        self.assertFalse(plan.is_valid)
+        self.assertIn('exatamente uma tag', plan.validate()[0])
+
+        # O catálogo real é filtrado pela API usando somente a tag persistente.
+        api = self.make_api([])
+        self.assertTrue(api.sincronizar_ramais([ramal()], dry_run=True))
+        self.assertEqual(len(api.zapi.host.creates), 0)
+        self.assertEqual(len(api.zapi.host.updates), 0)
+        self.assertEqual(api.zapi.host.get_calls[0]['tags'], [{'tag': 'ramal'}])
+        self.assertNotIn('groupids', api.zapi.host.get_calls[0])
+
+    def test_invalid_plan_does_not_apply_partial_changes(self):
+        api = self.make_api([])
+        auth_called = []
+        api.autenticar = lambda: auth_called.append(True) or True
+
+        self.assertFalse(api.sincronizar_ramais([ramal('03000'), ramal('3000')]))
+        self.assertEqual(auth_called, [])
+        self.assertEqual(api.zapi.host.creates, [])
+        self.assertEqual(api.zapi.host.updates, [])
+
     def test_repeated_synchronization_is_idempotent(self):
         api = self.make_api([self.tagged_host()])
 
@@ -100,6 +138,37 @@ class TestStableIdentity(unittest.TestCase):
 
         self.assertEqual([action.action for action in plan.actions], ['create', 'create'])
         self.assertEqual(plan.hosts_found, 0)
+        self.assertTrue(plan.is_valid)
+
+    def test_executor_executes_only_planned_actions(self):
+        api = self.make_api([])
+        plan = SyncPlan([
+            SyncAction('create', ramal('1000')),
+            SyncAction('invalid', ramal('1001'), reason='duplicado'),
+        ])
+
+        errors = ZabbixPlanExecutor(api, '1', None).execute(plan)
+
+        self.assertEqual(errors, 1)
+        self.assertEqual(api.zapi.host.creates, [])
+
+    def test_planner_rejects_host_with_invalid_identity_tag(self):
+        plan = SyncPlanner.build(
+            [ramal('1000')],
+            [{'hostid': '42', 'host': 'ramal-1000', 'tags': [{'tag': 'ramal', 'value': ''}]}],
+            'ramal',
+        )
+
+        self.assertFalse(plan.is_valid)
+        self.assertIn('valor inválido', plan.validate()[0])
+
+    def test_report_is_shared_by_dry_run_and_execution(self):
+        api = self.make_api([])
+        dry_report = SyncReport(dry_run=True)
+        self.assertTrue(api.sincronizar_ramais([ramal()], dry_run=True, report=dry_report))
+        self.assertIs(api.last_report, dry_report)
+        self.assertEqual(dry_report.created, 1)
+        self.assertIsNotNone(dry_report.plan)
 
     def test_development_limit_is_optional_and_validated(self):
         with patch.dict(os.environ, {}, clear=True):
