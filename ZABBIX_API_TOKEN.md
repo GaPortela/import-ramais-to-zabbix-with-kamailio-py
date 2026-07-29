@@ -45,6 +45,7 @@ ZABBIX_USER=
 ZABBIX_PASSWORD=
 ZABBIX_GROUP_NAME=Ramais UNIMED
 ZABBIX_TEMPLATE_NAME=ICMP Ping
+HOST_PREFIX=ORGANIZACAO
 ```
 
 ### Opção 2: Usando Usuário e Senha (Legado)
@@ -57,6 +58,7 @@ ZABBIX_USER=seu_usuario_zabbix
 ZABBIX_PASSWORD=sua_senha_zabbix
 ZABBIX_GROUP_NAME=Ramais UNIMED
 ZABBIX_TEMPLATE_NAME=ICMP Ping
+HOST_PREFIX=ORGANIZACAO
 ```
 
 ## Comportamento da Autenticação
@@ -75,6 +77,7 @@ O usuário (ou token) deve ter permissões para:
 - **Template**: Get
 - **Host Group**: Get
 - **Interface**: Create, Update
+- **Tags e descrição do host**: permissão de atualização de host (incluída em Host: Update)
 
 ### Exemplo de Role para Token
 
