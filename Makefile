@@ -5,7 +5,7 @@ PYTHON ?= python3
 PIP ?= pip3
 VENV := venv
 SCRIPT := kamailio_zabbix_sync.py
-TESTS := test_data_parser.py test_runtime_config.py
+TESTS := test_data_parser.py test_runtime_config.py test_stable_identity.py
 DOCKER_IMAGE ?= kamailio-zabbix-sync
 
 ifeq ($(OS),Windows_NT)
@@ -187,7 +187,7 @@ docker-run:
 
 docker-test:
 	@echo "🐳 Executando testes no container..."
-	docker run --rm $(DOCKER_IMAGE) python -m pytest test_data_parser.py test_runtime_config.py -q
+	docker run --rm $(DOCKER_IMAGE) python -m pytest $(TESTS) -q
 
 docker-shell:
 	@echo "🐳 Abrindo shell no container..."

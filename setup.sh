@@ -175,7 +175,7 @@ run_tests() {
     fi
 
     print_info "Rodando testes unitários..."
-    if pytest test_data_parser.py -q; then
+    if pytest test_data_parser.py test_runtime_config.py test_stable_identity.py -q; then
         print_success "Todos os testes passaram!"
     else
         print_error "Alguns testes falharam"
@@ -236,7 +236,7 @@ print_menu() {
     echo -e "  ${YELLOW}3. Execute o script principal:${NC}"
     echo -e "     python3 kamailio_zabbix_sync.py\n"
     echo -e "  ${YELLOW}4. Rode os testes:${NC}"
-    echo -e "     pytest test_data_parser.py -v\n"
+    echo -e "     pytest -q\n"
     echo -e "  ${YELLOW}5. Consulte a documentação:${NC}"
     echo -e "     - README.md (início rápido)"
     echo -e "     - DOCUMENTACAO.md (guia completo)"
