@@ -75,6 +75,20 @@ def parse_bool(value: Optional[str]) -> bool:
     return str(value).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
 
 
+def get_development_limit() -> Optional[int]:
+    """Retorna LIMIT para desenvolvimento; ausente significa processamento completo."""
+    value = os.getenv('LIMIT', '').strip()
+    if not value:
+        return None
+    try:
+        limit = int(value)
+    except ValueError:
+        raise ValueError('LIMIT deve ser um inteiro positivo')
+    if limit <= 0:
+        raise ValueError('LIMIT deve ser um inteiro positivo')
+    return limit
+
+
 DB_CONFIG = build_db_config()
 ZABBIX_CONFIG = build_zabbix_config()
 
@@ -110,6 +124,25 @@ class RamalInfo:
     def __str__(self):
         return (f"Ramal: {self.numero_ramal} | IP: {self.ip} | "
                 f"Marca: {self.marca} | Modelo: {self.modelo}")
+
+
+@dataclass
+class SyncAction:
+    """Uma ação já validada, pronta para ser executada ou exibida no dry-run."""
+    action: str
+    ramal: RamalInfo
+    host: Optional[Dict[str, Any]] = None
+    reason: str = ''
+
+
+@dataclass
+class SyncPlan:
+    """Plano imutável em intenção: decisões separadas da execução na API."""
+    actions: List[SyncAction]
+    hosts_found: int = 0
+
+    def count(self, action: str) -> int:
+        return sum(item.action == action for item in self.actions)
 
 
 # ============================================================================
@@ -224,7 +257,7 @@ class DataParser:
     @staticmethod
 
     def normalizar_numero_ramal(valor: Optional[str]) -> str:
-        """Normaliza o número do ramal removendo prefixos como c312 e mantendo somente o número do ramal."""
+        """Ponto único de normalização da identidade lógica de um ramal."""
         if not valor:
             return ''
 
@@ -429,7 +462,7 @@ class DataParser:
 class KamailioDB:
     """Classe para gerenciar conexão e queries ao banco PostgreSQL do Kamailio"""
 
-    def __init__(self, db_config: Dict):
+    def __init__(self, db_config: Dict, limit: Optional[int] = None):
         """
         Inicializa a conexão com o banco de dados.
         
@@ -437,6 +470,7 @@ class KamailioDB:
             db_config: Dicionário com credenciais (host, port, database, user, password)
         """
         self.db_config = db_config
+        self.limit = limit
         self.connection = None
 
     def conectar(self) -> bool:
@@ -495,7 +529,11 @@ class KamailioDB:
         
         try:
             cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-            cursor.execute(query)
+            if self.limit:
+                query += ' LIMIT %s'
+                cursor.execute(query, (self.limit,))
+            else:
+                cursor.execute(query)
             resultado = cursor.fetchall()
             cursor.close()
             
@@ -595,6 +633,68 @@ class KamailioDB:
 # INTEGRAÇÃO COM ZABBIX API
 # ============================================================================
 
+class SyncPlanner:
+    """Decide ações exclusivamente a partir da identidade estável e do catálogo lido."""
+
+    @staticmethod
+    def build(ramais: List[RamalInfo], hosts: List[Dict[str, Any]], tag_name: str) -> SyncPlan:
+        index: Dict[str, List[Dict[str, Any]]] = {}
+        for host in hosts:
+            numeros = set()
+            for tag in host.get('tags', []):
+                if tag.get('tag') == tag_name:
+                    numero = DataParser.normalizar_numero_ramal(tag.get('value'))
+                    if numero:
+                        numeros.add(numero)
+            tecnico = re.fullmatch(r'ramal-(\d+)', str(host.get('host', '')), re.IGNORECASE)
+            if tecnico:
+                numeros.add(tecnico.group(1))
+            for numero in numeros:
+                index.setdefault(numero, []).append(host)
+
+        actions: List[SyncAction] = []
+        seen = set()
+        for ramal in ramais:
+            numero = DataParser.normalizar_numero_ramal(ramal.numero_ramal)
+            if not numero or numero in seen:
+                actions.append(SyncAction('invalid', ramal, reason='ramal vazio ou duplicado na origem'))
+                continue
+            seen.add(numero)
+            candidates = index.get(numero, [])
+            if len(candidates) > 1:
+                actions.append(SyncAction('invalid', ramal, reason='mais de um host possui a mesma identidade'))
+            elif candidates:
+                actions.append(SyncAction('update', ramal, host=candidates[0]))
+            else:
+                actions.append(SyncAction('create', ramal))
+        return SyncPlan(actions=actions, hosts_found=len(hosts))
+
+
+class ZabbixPlanExecutor:
+    """Executa ações já decididas; não contém regras de identificação ou planejamento."""
+
+    def __init__(self, client: 'ZabbixAPI', group_id: str, template_id: Optional[str]):
+        self.client = client
+        self.group_id = group_id
+        self.template_id = template_id
+
+    def execute(self, plan: SyncPlan) -> int:
+        errors = plan.count('invalid')
+        for item in plan.actions:
+            if item.action == 'invalid':
+                continue
+            try:
+                if item.action == 'create':
+                    success = self.client.criar_host(item.ramal, self.group_id, self.template_id)
+                else:
+                    success = self.client.atualizar_host(item.host, item.ramal, self.group_id, self.template_id)
+                if not success:
+                    errors += 1
+            except Exception as exc:
+                logger.error('Erro ao executar %s para ramal %s: %s', item.action, item.ramal.numero_ramal, exc)
+                errors += 1
+        return errors
+
 class ZabbixAPI:
     """Classe para gerenciar integração com Zabbix via zabbix-utils"""
 
@@ -631,19 +731,35 @@ class ZabbixAPI:
             self.host_prefix = host_prefix or os.getenv('HOST_PREFIX', 'ORGANIZACAO')
 
         self.zapi = None
+        self.last_summary: Dict[str, Any] = {}
 
-    # Método centralizado para formatar o hostname no padrão configurado
-    def gerar_hostname(self, ramal: RamalInfo) -> str:
-        """
-        Gera o nome visível/hostname do host padronizado:
-        <ORGANIZACAO>-<MARCA>-<MODELO>-RAMAL <NUMERO>
-        """
+    RAMAL_TAG = 'ramal'
+
+    def gerar_nome_visual(self, ramal: RamalInfo) -> str:
+        """Gera o nome visual legado para hosts novos, sem usá-lo como identidade."""
         prefixo = (self.host_prefix or 'ORGANIZACAO').upper().strip()
         marca = (ramal.marca or 'GENERICO').upper().strip()
         modelo = (ramal.modelo or 'GENERICO').upper().strip()
         numero = (ramal.numero_ramal or '').strip()
 
         return f"{prefixo}-{marca}-{modelo}-RAMAL {numero}"
+
+    # Compatibilidade para consumidores antigos da classe. O resultado é visual,
+    # nunca deve ser usado para localizar um host durante a sincronização.
+    gerar_hostname = gerar_nome_visual
+
+    def gerar_hostname_tecnico(self, numero_ramal: str) -> str:
+        """Retorna o identificador técnico estável de um ramal normalizado."""
+        numero = DataParser.normalizar_numero_ramal(numero_ramal)
+        if not numero:
+            raise ValueError('Número de ramal inválido')
+        return f'ramal-{numero}'
+
+    def _tags_ramal(self, numero_ramal: str) -> List[Dict[str, str]]:
+        return [{'tag': self.RAMAL_TAG, 'value': DataParser.normalizar_numero_ramal(numero_ramal)}]
+
+    def _description(self, ramal: RamalInfo) -> str:
+        return f"User-Agent: {ramal.user_agent or 'não informado'}"
 
     # Refatorado para usar nativamente a inicialização e autenticação da biblioteca zabbix-utils
     def autenticar(
@@ -686,21 +802,25 @@ class ZabbixAPI:
             logger.error(f"Erro inesperado na autenticação com Zabbix: {e}")
             return False
 
-    def criar_host(self, hostname: str, ip: str, group_id: str, template_id: Optional[str] = None) -> bool:
+    def criar_host(self, ramal: RamalInfo, group_id: str, template_id: Optional[str] = None) -> bool:
         """Cria um host no Zabbix utilizando zabbix-utils."""
         if not self.zapi:
             logger.error("ZabbixAPI não inicializado. Chame autenticar() primeiro.")
             return False
 
         try:
+            numero = DataParser.normalizar_numero_ramal(ramal.numero_ramal)
+            hostname_tecnico = self.gerar_hostname_tecnico(numero)
             params = {
-                'host': hostname,
-                'name': hostname,
+                'host': hostname_tecnico,
+                'name': self.gerar_nome_visual(ramal),
+                'tags': self._tags_ramal(numero),
+                'description': self._description(ramal),
                 'interfaces': [{
                     'type': 1,  # Agent
                     'main': 1,
                     'useip': 1,
-                    'ip': ip,
+                    'ip': ramal.ip,
                     'dns': '',
                     'port': '10050'
                 }],
@@ -712,42 +832,26 @@ class ZabbixAPI:
 
             result = self.zapi.host.create(**params)
             if result and 'hostids' in result:
-                logger.info(f"Host '{hostname}' criado com sucesso no Zabbix (ID: {result['hostids'][0]})")
+                logger.info(f"Host '{hostname_tecnico}' criado com sucesso no Zabbix (ID: {result['hostids'][0]})")
                 return True
 
-            logger.error(f"Falha ao criar host '{hostname}' no Zabbix")
+            logger.error(f"Falha ao criar host '{hostname_tecnico}' no Zabbix")
             return False
 
         except Exception as e:
-            logger.error(f"Erro inesperado ao criar host '{hostname}': {e}")
+            logger.error(f"Erro inesperado ao criar host do ramal '{ramal.numero_ramal}': {e}")
             return False
 
-    def atualizar_host(self, hostname: str, ip: str, group_id: str, template_id: Optional[str] = None) -> bool:
-        """Atualiza a interface IP de um host existente no Zabbix utilizando zabbix-utils."""
+    def atualizar_host(self, host: Dict[str, Any], ramal: RamalInfo, group_id: str,
+                        template_id: Optional[str] = None) -> bool:
+        """Atualiza atributos mutáveis e grava a tag de identidade persistente."""
         if not self.zapi:
             logger.error("ZabbixAPI não inicializado. Chame autenticar() primeiro.")
             return False
 
         try:
-            # Busca nativa via zabbix-utils filtrando pelo nome do host
-            hosts = self.zapi.host.get(
-                filter={'name': hostname},
-                selectInterfaces=['interfaceid', 'ip', 'main']
-            )
-
-            if not hosts:
-                # Fallback de busca pelo campo 'host' técnico caso divirja do 'name'
-                hosts = self.zapi.host.get(
-                    filter={'host': hostname},
-                    selectInterfaces=['interfaceid', 'ip', 'main']
-                )
-
-            if not hosts:
-                logger.warning(f"Host '{hostname}' não encontrado para atualização")
-                return False
-
-            host_id = hosts[0]['hostid']
-            interfaces = hosts[0].get('interfaces', [])
+            host_id = host['hostid']
+            interfaces = host.get('interfaces', [])
 
             # Atualização das interfaces de rede utilizando o id existente quando disponível
             if interfaces:
@@ -757,7 +861,7 @@ class ZabbixAPI:
                     'type': 1,
                     'main': 1,
                     'useip': 1,
-                    'ip': ip,
+                    'ip': ramal.ip,
                     'dns': '',
                     'port': '10050'
                 }]
@@ -766,15 +870,19 @@ class ZabbixAPI:
                     'type': 1,
                     'main': 1,
                     'useip': 1,
-                    'ip': ip,
+                    'ip': ramal.ip,
                     'dns': '',
                     'port': '10050'
                 }]
 
             params = {
                 'hostid': host_id,
+                'host': self.gerar_hostname_tecnico(ramal.numero_ramal),
+                'name': self.gerar_nome_visual(ramal),
+                'description': self._description(ramal),
                 'interfaces': interface_params,
-                'groups': [{'groupid': group_id}]
+                'groups': [{'groupid': group_id}],
+                'tags': self._tags_ramal(ramal.numero_ramal)
             }
 
             if template_id:
@@ -783,14 +891,14 @@ class ZabbixAPI:
             # Atualização do host via zabbix-utils
             update_result = self.zapi.host.update(**params)
             if update_result and 'hostids' in update_result:
-                logger.info(f"Host '{hostname}' atualizado com sucesso no Zabbix")
+                logger.info(f"Host '{host.get('host', host_id)}' atualizado com sucesso no Zabbix")
                 return True
 
-            logger.error(f"Falha ao atualizar host '{hostname}' no Zabbix")
+            logger.error(f"Falha ao atualizar host '{host_id}'")
             return False
 
         except Exception as e:
-            logger.error(f"Erro inesperado ao atualizar host '{hostname}': {e}")
+            logger.error(f"Erro inesperado ao atualizar host '{host_id}': {e}")
             return False
 
     # Refatorado para consulta nativa do id do grupo via zabbix-utils
@@ -834,29 +942,19 @@ class ZabbixAPI:
             logger.error(f"Erro ao obter ID do template '{template_nome}' via zabbix-utils: {e}")
             return None
 
-    # Refatorado para verificação nativa de existência do host por nome ou ID
-    def host_existe(self, hostname: str) -> bool:
-        """Verifica se um host existe no Zabbix utilizando zabbix-utils."""
-        if not self.zapi:
-            return False
+    def _catalogar_hosts(self, group_id: str) -> List[Dict[str, Any]]:
+        """Carrega o grupo uma única vez para busca escalável por identidade estável."""
+        return self.zapi.host.get(
+            groupids=[group_id], output=['hostid', 'host', 'name'],
+            selectInterfaces=['interfaceid', 'ip', 'main'], selectTags='extend'
+        ) or []
 
-        try:
-            result = self.zapi.host.get(filter={'name': hostname})
-            if result and len(result) > 0:
-                return True
+    def planejar_sincronizacao(self, ramais: List[RamalInfo], group_id: str) -> SyncPlan:
+        """Consulta o catálogo e delega a decisão a um planejador sem efeitos colaterais."""
+        return SyncPlanner.build(ramais, self._catalogar_hosts(group_id), self.RAMAL_TAG)
 
-            result_host = self.zapi.host.get(filter={'host': hostname})
-            return bool(result_host and len(result_host) > 0)
-
-        except Exception as e:
-            logger.error(f"Erro ao verificar existência do host '{hostname}' via zabbix-utils: {e}")
-            return False
-
-    # Atualizado para utilizar o novo padrão de hostname gerado pelo método centralizado
-    def sincronizar_ramais(self, ramais: List[RamalInfo]) -> bool:
-        """
-        Sincroniza lista de ramais com Zabbix.
-        """
+    def sincronizar_ramais(self, ramais: List[RamalInfo], dry_run: bool = False) -> bool:
+        """Sincroniza por identidade persistente; no dry-run apenas produz o plano."""
         if not self.autenticar():
             return False
 
@@ -870,44 +968,28 @@ class ZabbixAPI:
         if not template_id:
             logger.warning(f"Template '{self.template_name}' não encontrado. Criando hosts sem template.")
 
-        hosts_criados = 0
-        hosts_atualizados = 0
-        hosts_erro = 0
+        plano = self.planejar_sincronizacao(ramais, grupo_id)
+        contagem = {acao: plano.count(acao) for acao in ('create', 'update', 'invalid')}
+        for item in plano.actions:
+            if item.action == 'invalid':
+                logger.error("Ramal %s: %s", item.ramal.numero_ramal, item.reason)
+            else:
+                logger.info("%s: ramal %s", item.action.upper(), item.ramal.numero_ramal)
 
-        for ramal in ramais:
-            try:
-                # Chamada para a montagem padronizada do hostname
-                hostname = self.gerar_hostname(ramal)
+        if dry_run:
+            logger.info("DRY-RUN: criaria=%s atualizaria=%s inconsistentes=%s",
+                        contagem['create'], contagem['update'], contagem['invalid'])
+            self.last_summary = {'hosts_found': plano.hosts_found, **contagem, 'errors': contagem['invalid'], 'dry_run': True}
+            return contagem['invalid'] == 0
 
-                if self.host_existe(hostname):
-                    logger.debug(f"Atualizando host {hostname}")
-                    result = self.atualizar_host(hostname, ramal.ip, grupo_id, template_id)
-                    if result:
-                        logger.info(f"✓ Host atualizado: {hostname} ({ramal.ip})")
-                        hosts_atualizados += 1
-                    else:
-                        logger.error(f"✗ Erro ao atualizar host {hostname}")
-                        hosts_erro += 1
-                else:
-                    logger.debug(f"Criando host {hostname}")
-                    result = self.criar_host(hostname, ramal.ip, grupo_id, template_id)
-                    if result:
-                        logger.info(f"✓ Host criado: {hostname} ({ramal.ip})")
-                        hosts_criados += 1
-                    else:
-                        logger.error(f"✗ Erro ao criar host {hostname}")
-                        hosts_erro += 1
-
-            except Exception as e:
-                logger.error(f"Erro ao processar ramal {ramal.numero_ramal}: {e}")
-                hosts_erro += 1
-                continue
+        hosts_erro = ZabbixPlanExecutor(self, grupo_id, template_id).execute(plano)
+        self.last_summary = {'hosts_found': plano.hosts_found, **contagem, 'errors': hosts_erro, 'dry_run': False}
 
         logger.info(f"\n{'='*60}")
         logger.info(f"SINCRONIZAÇÃO COM ZABBIX CONCLUÍDA")
         logger.info(f"{'='*60}")
-        logger.info(f"Hosts criados: {hosts_criados}")
-        logger.info(f"Hosts atualizados: {hosts_atualizados}")
+        logger.info(f"Hosts criados: {contagem['create']}")
+        logger.info(f"Hosts atualizados: {contagem['update']}")
         logger.info(f"Erros: {hosts_erro}")
         logger.info(f"{'='*60}\n")
 
@@ -1010,6 +1092,7 @@ def salvar_inspecao_json(ramais_brutos: List[Dict], ramais_processados: List[Ram
 
 def main(dry_run: Optional[bool] = None, apenas_inspecao: bool = False):
     """Função principal de orquestração."""
+    started_at = datetime.now()
 
     if dry_run is None:
         dry_run = parse_bool(os.getenv('DRY_RUN', 'False'))
@@ -1018,12 +1101,11 @@ def main(dry_run: Optional[bool] = None, apenas_inspecao: bool = False):
     logger.info(f"Timestamp: {datetime.now().isoformat()}\n")
 
     if dry_run:
-        logger.info("Modo dry-run ativo: nenhuma conexão com o banco ou Zabbix será realizada.")
-        return True
+        logger.info("Modo dry-run ativo: consultas ao banco/Zabbix são permitidas; nenhuma alteração será enviada.")
 
     if apenas_inspecao:
         logger.info("Modo inspeção ativo: apenas consultando os dados do banco e imprimindo relatório.")
-        db = KamailioDB(DB_CONFIG)
+        db = KamailioDB(DB_CONFIG, limit=get_development_limit())
         if not db.conectar():
             logger.error("Falha na conexão com o banco de dados. Abortando.")
             return False
@@ -1040,7 +1122,10 @@ def main(dry_run: Optional[bool] = None, apenas_inspecao: bool = False):
             logger.info("Inspeção finalizada")
     
     # Conecta ao banco do Kamailio
-    db = KamailioDB(DB_CONFIG)
+    development_limit = get_development_limit()
+    if development_limit:
+        logger.info("LIMIT de desenvolvimento ativo: %s ramais", development_limit)
+    db = KamailioDB(DB_CONFIG, limit=development_limit)
     
     if not db.conectar():
         logger.error("Falha na conexão com o banco de dados. Abortando.")
@@ -1066,8 +1151,16 @@ def main(dry_run: Optional[bool] = None, apenas_inspecao: bool = False):
         # Sincroniza ramais com Zabbix
         logger.info(f"\nSincronizando {len(ramais_processados)} ramais com Zabbix...")
         zabbix = ZabbixAPI(ZABBIX_CONFIG)
-        resultado_sync = zabbix.sincronizar_ramais(ramais_processados)
-        
+        resultado_sync = zabbix.sincronizar_ramais(ramais_processados, dry_run=dry_run)
+        summary = zabbix.last_summary
+        logger.info(
+            "RELATÓRIO FINAL%s: lidos=%s válidos=%s ignorados=%s encontrados=%s criados=%s atualizados=%s erros=%s tempo=%s",
+            ' (DRY-RUN)' if dry_run else '', len(ramais_brutos), len(ramais_processados),
+            len(ramais_brutos) - len(ramais_processados), summary.get('hosts_found', 0),
+            summary.get('create', 0), summary.get('update', 0), summary.get('errors', 0),
+            datetime.now() - started_at,
+        )
+
         return resultado_sync
         
     except Exception as e:
@@ -1081,7 +1174,7 @@ def main(dry_run: Optional[bool] = None, apenas_inspecao: bool = False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Sincroniza ramais Kamailio para Zabbix')
-    parser.add_argument('--dry-run', action='store_true', help='Executa apenas o fluxo de validação sem acessar o banco/Zabbix')
+    parser.add_argument('--dry-run', action='store_true', help='Exibe o plano de criação/atualização sem alterar o Zabbix')
     parser.add_argument('--inspecao', action='store_true', help='Consulta o banco e imprime relatório de dados brutos e parseados sem acessar o Zabbix')
     args = parser.parse_args()
 

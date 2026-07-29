@@ -1,6 +1,6 @@
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from kamailio_zabbix_sync import (
     DataParser,
@@ -9,6 +9,7 @@ from kamailio_zabbix_sync import (
     ZabbixAPI,
     build_db_config,
     build_zabbix_config,
+    get_development_limit,
 )
 
 
@@ -59,6 +60,22 @@ class TestRuntimeConfig(unittest.TestCase):
             self.assertIsNone(config["password"])
             self.assertEqual(config["group_name"], "Ramais")
             self.assertEqual(config["template_name"], "ICMP Ping")
+
+    def test_limit_de_desenvolvimento_e_opcional(self):
+        with patch.dict(os.environ, {'LIMIT': '3'}, clear=True):
+            self.assertEqual(get_development_limit(), 3)
+
+    def test_query_usa_limit_quando_configurado(self):
+        db = KamailioDB({}, limit=3)
+        db.connection = MagicMock()
+        cursor = db.connection.cursor.return_value
+        cursor.fetchall.return_value = []
+
+        db.buscar_ramais_ativos()
+
+        query, params = cursor.execute.call_args.args
+        self.assertIn('LIMIT %s', query)
+        self.assertEqual(params, (3,))
 
 
 class TestStabilizedContracts(unittest.TestCase):
